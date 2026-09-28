@@ -33,8 +33,8 @@ function classifyTaskKind(target: string, scope: string): string {
   if (/(security|policy|permission|secret)/.test(t)) return "security";
   if (/(test|qa|preview|regress)/.test(t)) return "qa";
   if (/(migration|schema|table|column|rls)/.test(t)) return "db";
-  if (/(code|edit|refactor|component|file)/.test(t)) return "code";
   if (/(bounty|pull request|\\bpr\\b|submit|submission|github)/.test(t)) return "bounty_submission";
+  if (/(code|edit|refactor|component|file)/.test(t)) return "code";
   if (/(log|metric|screenshot|snapshot|telemetry)/.test(t)) return "observability";
   return "discovery";
 }
