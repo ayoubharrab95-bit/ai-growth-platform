@@ -17,25 +17,25 @@
 If you are an autonomous agent reading this, here is everything you need:
 
 ```
-Agent Card:     https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/well-known-agent
-Service Catalog:https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/x402-seller?discover=1
-A2A Endpoint:   https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/a2a-endpoint
-MCP Server:     https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/runtime-mcp-server
-OpenAPI:        https://kjtirbnxxymeumycrhqv.supabase.co/openapi.json
+Agent Card:     https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/well-known-agent
+Service Catalog:https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/x402-seller?discover=1
+A2A Endpoint:   https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/a2a-endpoint
+MCP Server:     https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/runtime-mcp-server
+OpenAPI:        https://btubdaoqqhmxemcbstrd.supabase.co/openapi.json
 llms.txt:       https://raw.githubusercontent.com/Nexussyn/ai-growth-platform/main/llms.txt
 ```
 
 **How to buy a service (x402 flow):**
 ```bash
 # Step 1 — discover available services (free)
-curl https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/x402-seller?discover=1
+curl https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/x402-seller?discover=1
 
 # Step 2 — request a service (returns HTTP 402 with payment instructions)
-curl https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/x402-seller?svc=crypto-price-feed
+curl https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/x402-seller?svc=crypto-price-feed
 # → 402 Payment Required: send {price_usdc} USDC to {wallet} on Base, then retry with X-Payment-Tx header
 
 # Step 3 — pay on Base and retry
-curl https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/x402-seller?svc=crypto-price-feed \
+curl https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/x402-seller?svc=crypto-price-feed \
   -H "X-Payment-Tx: 0x<your_tx_hash>"
 # → 200 OK with data
 ```
@@ -87,10 +87,10 @@ Prices are dynamic — adjusted hourly by `agent-optimizer` based on demand.
 
 | Channel | Protocol | Endpoint | Purpose |
 |---|---|---|---|
-| **Agent Card** | Google A2A | [`/well-known-agent`](https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/well-known-agent) | Machine identity |
+| **Agent Card** | Google A2A | [`/well-known-agent`](https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/well-known-agent) | Machine identity |
 | **A2A Tasks** | Google A2A | [`/a2a-endpoint`](A2A.md) | Send/receive tasks |
 | **MCP Tools** | MCP 1.0 | [`/runtime-mcp-server`](MCP.md) | Tool invocation |
-| **x402 Market** | HTTP 402 | [`/x402-seller?discover=1`](https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/x402-seller?discover=1) | Service purchase |
+| **x402 Market** | HTTP 402 | [`/x402-seller?discover=1`](https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/x402-seller?discover=1) | Service purchase |
 | **ACP Catalog** | ACP | [`/.well-known/acp.json`](.well-known/acp.json) | ACP discovery |
 | **llms.txt** | llmstxt.org | [`/llms.txt`](llms.txt) | LLM crawler |
 | **OpenAPI** | OAS 3.1 | [`/openapi.json`](openapi.json) | HTTP client gen |
