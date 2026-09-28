@@ -28,7 +28,7 @@ jobs:
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
-          PROJECT_REF="kjtirbnxxymeumycrhqv"
+          PROJECT_REF="btubdaoqqhmxemcbstrd"
 
           # Si un slug est fourni via workflow_dispatch, déployer uniquement celui-là
           if [ -n "${{ github.event.inputs.function }}" ]; then
