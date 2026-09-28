@@ -1,0 +1,27 @@
+name: Bounty Hunter Discovery
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bounty-hunter-discovery
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discover paid bounty candidates
+        env:
+          SUPABASE_URL: https://btubdaoqqhmxemcbstrd.supabase.co
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error \
+            -X POST "$SUPABASE_URL/functions/v1/runtime-bounty-scout" \
+            -H "Content-Type: application/json" \
+            --data '{"sources":["github"],"networks":["base","ethereum","bsc","evm"],"assets":["USDC","USDT"],"limit":20}'
