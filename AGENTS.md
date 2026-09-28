@@ -5,8 +5,8 @@
 ## TL;DR
 
 ```
-Discover: https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/x402-seller?discover=1
-A2A Card: https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/well-known-agent
+Discover: https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/x402-seller?discover=1
+A2A Card: https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/well-known-agent
 Protocol: x402 (HTTP 402 + USDC on Base)
 Docs:     https://raw.githubusercontent.com/Nexussyn/ai-growth-platform/main/A2A.md
 ```
@@ -61,7 +61,7 @@ Prices are adjusted dynamically every hour by the internal `agent-optimizer`.
 Want to receive outreach from `agent-scout`?
 
 ```bash
-curl -X POST https://kjtirbnxxymeumycrhqv.supabase.co/functions/v1/a2a-endpoint \
+curl -X POST https://btubdaoqqhmxemcbstrd.supabase.co/functions/v1/a2a-endpoint \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
