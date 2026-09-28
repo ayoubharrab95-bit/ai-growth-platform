@@ -62,6 +62,12 @@ Deno.serve(async (req: Request) => {
 
     const candidates = [];
     for (const item of data.items ?? []) {
+      const text = String(item.title ?? "") + "\n" + String(item.body ?? "");
+      const hasBountySignal = /(bounty|reward)/i.test(text);
+      const hasMoneySignal = /(\$\s?\d+|\d+\s?(USD|USDC|USDT)|RTC)/i.test(text);
+      const hasExecutionSignal = /(claim|how to claim|pull request|\\bpr\\b|submit)/i.test(text);
+      const excluded = /(security finding|sql injection|cwe-\\d+|marketing|content round|star rustchain)/i.test(text);
+      if (!hasBountySignal || !hasMoneySignal || !hasExecutionSignal || excluded) continue;
       const url = safeUrl(item.html_url ?? "");
       if (!url) continue;
 
