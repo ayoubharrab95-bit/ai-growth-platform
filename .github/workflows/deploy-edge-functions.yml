@@ -33,8 +33,11 @@ jobs:
           # Si un slug est fourni via workflow_dispatch, déployer uniquement celui-là
           if [ -n "${{ github.event.inputs.function }}" ]; then
             echo "▶ Deploying single function: ${{ github.event.inputs.function }}"
-            supabase functions deploy ${{ github.event.inputs.function }} \
-              --project-ref $PROJECT_REF --no-verify-jwt
+            if [ "${{ github.event.inputs.function }}" = "runtime-bounty-submit" ]; then
+              supabase functions deploy "${{ github.event.inputs.function }}" --project-ref $PROJECT_REF
+            else
+              supabase functions deploy "${{ github.event.inputs.function }}" --project-ref $PROJECT_REF --no-verify-jwt
+            fi
             exit 0
           fi
 
@@ -50,8 +53,10 @@ jobs:
           echo "Functions to deploy: $CHANGED"
           for fn in $CHANGED; do
             echo "▶ Deploying $fn ..."
-            supabase functions deploy $fn \
-              --project-ref $PROJECT_REF --no-verify-jwt \
-              && echo "✅ $fn deployed" \
-              || echo "❌ $fn failed (non-blocking)"
+            if [ "$fn" = "runtime-bounty-submit" ]; then
+              supabase functions deploy "$fn" --project-ref $PROJECT_REF
+            else
+              supabase functions deploy "$fn" --project-ref $PROJECT_REF --no-verify-jwt
+            fi
+            echo "✅ $fn deployed"
           done

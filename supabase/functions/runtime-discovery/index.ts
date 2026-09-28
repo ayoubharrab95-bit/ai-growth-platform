@@ -14,10 +14,11 @@ const ROUTING: Record<string, string> = {
   security: "runtime-security",
   deploy: "runtime-deploy",
   observability: "runtime-observability",
+  bounty_submission: "runtime-bounty-submit",
   rollback: "runtime-rollback",
 };
 
-const STOP_REASONS = ["security_violation", "missing_diff", "missing_preview_change", "source_loop", "failed_rollback", "code_ui_divergence"];
+const STOP_REASONS = ["security_violation", "missing_diff", "missing_preview_change", "source_loop", "failed_rollback", "code_ui_divergence", "submission_blocked", "needs_human"];
 
 async function audit(taskId: string, action: string, diff: Record<string, unknown>, evidence: Record<string, unknown>, err: string | null = null) {
   await sql`INSERT INTO runtime_audit_log (task_id, agent_role, action, diff_or_effect, evidence, error) VALUES (${taskId}, ${ROLE}, ${action}, ${sql.json(diff)}, ${sql.json(evidence)}, ${err})`;
@@ -32,6 +33,7 @@ function classifyTaskKind(target: string, scope: string): string {
   if (/(security|policy|permission|secret)/.test(t)) return "security";
   if (/(test|qa|preview|regress)/.test(t)) return "qa";
   if (/(migration|schema|table|column|rls)/.test(t)) return "db";
+  if (/(bounty|pull request|\\bpr\\b|submit|submission|github)/.test(t)) return "bounty_submission";
   if (/(code|edit|refactor|component|file)/.test(t)) return "code";
   if (/(log|metric|screenshot|snapshot|telemetry)/.test(t)) return "observability";
   return "discovery";
@@ -39,7 +41,7 @@ function classifyTaskKind(target: string, scope: string): string {
 
 function rankPriority(risk: string, kind: string): number {
   const riskScore = risk === "high" ? 10 : risk === "medium" ? 5 : 1;
-  const kindBoost: Record<string, number> = { rollback: 100, security: 80, deploy: 60, db: 50, qa: 40, code: 30, observability: 20, discovery: 10 };
+  const kindBoost: Record<string, number> = { rollback: 100, security: 80, deploy: 60, db: 50, qa: 40, bounty_submission: 35, code: 30, observability: 20, discovery: 10 };
   return (kindBoost[kind] ?? 0) + riskScore;
 }
 
