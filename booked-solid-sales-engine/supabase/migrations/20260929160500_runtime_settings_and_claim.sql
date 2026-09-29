@@ -23,3 +23,10 @@ begin
 end $$;
 revoke all on function booked_solid.claim_work(text) from public;
 grant execute on function booked_solid.claim_work(text) to service_role;
+
+create or replace function public.claim_booked_solid_work(p_worker text)
+returns setof booked_solid.work_queue language sql security definer
+set search_path=booked_solid,public
+as $$ select * from booked_solid.claim_work(p_worker); $$;
+revoke all on function public.claim_booked_solid_work(text) from public;
+grant execute on function public.claim_booked_solid_work(text) to service_role;
