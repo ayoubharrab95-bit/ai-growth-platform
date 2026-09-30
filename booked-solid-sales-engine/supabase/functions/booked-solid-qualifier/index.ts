@@ -35,11 +35,11 @@ Deno.serve(async req=>{
    await db.schema("booked_solid").from("leads").update({status:"suppressed",why_now:isVendor?"Excluded: technology/software vendor rather than an end-customer operating business.":hospitalityNonBuyer?"Excluded: hospitality property rather than a property-management operator.":"Excluded: lead-generation/quote page rather than an operating company.",updated_at:new Date().toISOString()}).eq("company_id",id).neq("status","won");
    return out({ok:true,company_id:id,status:"rejected",reason:isVendor?"software_vendor":hospitalityNonBuyer?"hospitality_nonbuyer":"leadgen_page"});
   }
-  const contractorTrades=["HVAC","Roofing","Plumbing","Electrical","Remodeling","Painting","General Contractor","Commercial Contractor","Cabinet","Flooring","Concrete","Landscaping","Windows","Siding","Deck Builder","Home Builder","Construction"];
+  const contractorTrades=["HVAC","Roofing","Plumbing","Electrical","Remodeling","Painting","Fence","General Contractor","Commercial Contractor","Cabinet","Flooring","Concrete","Landscaping","Windows","Siding","Deck Builder","Home Builder","Construction"];
   const fit=contractorTrades.includes(company.trade)?25:company.trade==="Property Operations"?22:15;
   const painTypes=["estimation_pain","field_quoting","change_orders","workflow_complexity"];
   const pain=Math.min(35,Array.from(types).filter(t=>painTypes.includes(t)).length*12);
-  const evidenceScore=Math.min(20,rows.filter((x:any)=>x.evidence_type!=="search_result").length*4);
+  const realEvidenceTypes=new Set(rows.filter((x:any)=>x.evidence_type!=="search_result").map((x:any)=>String(x.evidence_type||"")));const evidenceScore=Math.min(20,realEvidenceTypes.size*4);
   const usableContact=(contacts??[]).find((c:any)=>c.email&&!weakMailbox(c.email)&&c.status!=="invalid"&&c.status!=="suppressed");const contact=usableContact?.email_confidence??0;
   const contactScore=Math.min(20,Number(contact)/5);
   const score=Math.min(100,fit+pain+evidenceScore+contactScore);const opportunityScore=Math.round(Math.min(100,score*0.82+triggerScore*0.18));const priorityBand=triggerScore>=35&&opportunityScore>=80?"hot":opportunityScore>=70?"high":triggerScore>=20?"signal":"standard";
@@ -49,7 +49,7 @@ Deno.serve(async req=>{
   const prospectType=types.has("estimation_pain")||types.has("field_quoting")||types.has("change_orders")?"pain_led":"fit_led";
   const why=triggers.strongest?.claim||(prospectType==="pain_led"?"Public evidence shows a relevant operational/estimating signal.":"Company appears to fit Booked Solid's target customer profile; no pain is assumed.");
   const priorQualified=(existingLeads??[]).some((x:any)=>x.status==="qualified");
-  const status=priorQualified?"qualified":score>=65&&rows.filter((x:any)=>x.evidence_type!=="search_result").length>=1?"qualified":score>=40?"candidate":"rejected";
+  const status=priorQualified?"qualified":score>=65&&realEvidenceTypes.size>=1?"qualified":score>=40?"candidate":"rejected";
   const priorBrief=(existingLeads??[]).find((x:any)=>x.status==="qualified")?.lead_brief??(existingLeads??[])[0]?.lead_brief??{};
   const {data:lead,error:le}=await db.schema("booked_solid").from("leads").upsert({
     company_id:id,contact_id:usableContact?.id??null,offer,score,
