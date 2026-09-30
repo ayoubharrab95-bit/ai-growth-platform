@@ -3,7 +3,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 const H={"Content-Type":"application/json","Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"authorization, x-client-info, apikey, content-type"};
 const db=createClient(Deno.env.get("SUPABASE_URL")!,Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const out=(x:unknown,s=200)=>new Response(JSON.stringify(x),{status:s,headers:H});
-function weakMailbox(email:string){const e=String(email||"").toLowerCase();const lp=e.split("@")[0];return !lp||lp.length<2||["first","firstname","test","example"].includes(lp)||/^(employment|careers?|jobs?|support|concierge|reservations?|dining|spa|events?|groups?|hr|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)@/i.test(e)}
+function weakMailbox(email:string){const e=String(email||"").toLowerCase();const lp=e.split("@")[0];return !lp||lp.length<2||["first","firstname","test","example"].includes(lp)||/(employment|careers?|jobs?|support|concierge|reservations?|dining|spa|events?|groups?|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)/.test(lp)||lp==="hr"}
 
 
 Deno.serve(async req=>{
