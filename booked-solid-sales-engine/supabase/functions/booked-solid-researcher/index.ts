@@ -69,10 +69,12 @@ Deno.serve(async req=>{
   const types=evidence(combined);const triggerRows=triggers(combined);
   if(company){
    await db.schema("booked_solid").from("companies").update({status:"researching",last_researched_at:new Date().toISOString()}).eq("id",company.id);
-   for(const type of types)await db.schema("booked_solid").from("evidence").insert({
-    company_id:company.id,evidence_type:type,claim:"Public website contains signals related to "+type,
-    snippet:combined.slice(0,1200),source_url:root.toString(),confidence:70,metadata:{pages_researched:pages}
-   });
+   for(const type of types){
+    const claim="Public website contains signals related to "+type;
+    const {data:oldEv}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",company.id).eq("evidence_type",type).eq("source_url",root.toString()).eq("claim",claim).limit(1);
+    if((oldEv??[]).length) await db.schema("booked_solid").from("evidence").update({snippet:combined.slice(0,1200),confidence:70,observed_at:new Date().toISOString(),metadata:{pages_researched:pages}}).eq("id",oldEv[0].id);
+    else await db.schema("booked_solid").from("evidence").insert({company_id:company.id,evidence_type:type,claim,snippet:combined.slice(0,1200),source_url:root.toString(),confidence:70,metadata:{pages_researched:pages}});
+   }
    for(const tr of triggerRows){const {data:x}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",company.id).eq("evidence_type",tr.type).eq("source_url",root.toString()).limit(1);if((x??[]).length)await db.schema("booked_solid").from("evidence").update({claim:tr.claim,snippet:combined.slice(0,1200),confidence:80,observed_at:new Date().toISOString(),metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}}).eq("id",x![0].id);else await db.schema("booked_solid").from("evidence").insert({company_id:company.id,evidence_type:tr.type,claim:tr.claim,snippet:combined.slice(0,1200),source_url:root.toString(),confidence:80,metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}});}
    for(const email of foundEmails)await db.schema("booked_solid").from("contacts").upsert({
     company_id:company.id,email,email_confidence:60,source_url:root.toString(),status:"unverified"
