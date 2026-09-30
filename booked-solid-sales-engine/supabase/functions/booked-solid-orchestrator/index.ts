@@ -92,7 +92,7 @@ async function queueOneEnrichment(){
   const active=new Set((activeResearch??[]).map((x:any)=>String(x.payload?.company_id||"")).filter(Boolean));
   const pool=(leads??[]).filter((x:any)=>Number(x.companies?.enrichment_version??0)<1&&!active.has(String(x.company_id)));
   const next=pool[0];if(!next)return null;
-  const priority=next.status==="qualified"?85+Math.min(10,Number(next.score||0)*0.1):40+Math.min(8,Number(next.score||0)*0.05);
+  const priority=next.status==="qualified"?45+Math.min(5,Number(next.score||0)*0.05):25+Math.min(5,Number(next.score||0)*0.03);
   const {data,error}=await db.schema("booked_solid").from("work_queue").insert({
     kind:"research",priority,
     payload:{company_id:next.company_id,strategy_id:next.strategy_id,reason:"incremental_enrichment_v1"},
