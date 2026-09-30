@@ -77,6 +77,31 @@ async function chooseStrategies(limit = 50) {
   return ranked.slice(0, limit);
 }
 
+async function queueOneEnrichment(){
+  const [{data:leads},{data:activeResearch}] = await Promise.all([
+    db.schema("booked_solid").from("leads")
+      .select("id,company_id,strategy_id,score,status,companies!inner(id,enrichment_version,last_enriched_at)")
+      .in("status",["qualified","candidate"])
+      .order("score",{ascending:false})
+      .limit(200),
+    db.schema("booked_solid").from("work_queue")
+      .select("payload")
+      .eq("kind","research")
+      .in("status",["pending","running"])
+  ]);
+  const active=new Set((activeResearch??[]).map((x:any)=>String(x.payload?.company_id||"")).filter(Boolean));
+  const pool=(leads??[]).filter((x:any)=>Number(x.companies?.enrichment_version??0)<1&&!active.has(String(x.company_id)));
+  const next=pool[0];if(!next)return null;
+  const priority=next.status==="qualified"?85+Math.min(10,Number(next.score||0)*0.1):40+Math.min(8,Number(next.score||0)*0.05);
+  const {data,error}=await db.schema("booked_solid").from("work_queue").insert({
+    kind:"research",priority,
+    payload:{company_id:next.company_id,strategy_id:next.strategy_id,reason:"incremental_enrichment_v1"},
+    status:"pending",available_at:new Date().toISOString()
+  }).select("id,priority,payload").single();
+  if(error)throw error;
+  return {job_id:data.id,company_id:next.company_id,lead_id:next.id,lead_status:next.status,priority};
+}
+
 async function planCycle(body: any) {
   const { data: settings } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).single();
   if (!settings?.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
@@ -180,12 +205,16 @@ async function planCycle(body: any) {
     const m=(marketRows??[]).find((x:any)=>x.display_name===mn);
     if(m)await db.schema("booked_solid").from("market_catalog").update({uses_count:Number(m.uses_count??0)+1,last_used_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",m.id);
   }
+  const enrichment=await queueOneEnrichment();
 
   return json({
     ok: true,
     mode: "planner",
     email_gate: "blocked_until_email_configuration",
     queued: queued?.length ?? 0,
+    enrichment_queued: enrichment,
+    discovery_preserved: true,
+    enrichment_is_additive_not_a_gate: true,
     diversity: {
       recent_window_cycles: 8,
       max_attempts_per_trade: 3,
@@ -206,12 +235,14 @@ async function planCycle(body: any) {
 }
 
 async function health() {
-  const [{ count: companies }, { count: leads }, { count: pending }, { count: blocked }] =
+  const [{ count: companies }, { count: leads }, { count: pending }, { count: blocked }, { count: phones }, { count: smsEligible }] =
     await Promise.all([
       db.schema("booked_solid").from("companies").select("*", { count: "exact", head: true }),
       db.schema("booked_solid").from("leads").select("*", { count: "exact", head: true }),
       db.schema("booked_solid").from("work_queue").select("*", { count: "exact", head: true }).eq("status", "pending"),
       db.schema("booked_solid").from("outreach_queue").select("*", { count: "exact", head: true }).eq("status", "blocked_email_not_configured"),
+      db.schema("booked_solid").from("contacts").select("*", { count: "exact", head: true }).not("phone","is",null),
+      db.schema("booked_solid").from("contacts").select("*", { count: "exact", head: true }).eq("sms_eligible",true),
     ]);
 
   return json({
@@ -219,14 +250,19 @@ async function health() {
     system: "booked-solid-sales-engine",
     status: "ACTIVE",
     email_gate: "BLOCKED_NOT_CONFIGURED",
+    sms_gate: "BLOCKED_CONSENT_AND_PROVIDER_REQUIRED",
     metrics: {
       companies: companies ?? 0,
       leads: leads ?? 0,
       pending_work: pending ?? 0,
       messages_blocked_by_email_gate: blocked ?? 0,
+      phones_collected: phones ?? 0,
+      sms_eligible_contacts: smsEligible ?? 0,
     },
     guarantees: {
       no_email_without_configuration: true,
+      no_sms_without_configuration_and_consent: true,
+      enrichment_never_reduces_discovery: true,
       no_maps_export_pipeline: true,
       evidence_required_for_personalization: true,
       suppression_list_supported: true,
