@@ -10,6 +10,13 @@ function clean(html:string){
  .replace(/<[^>]+>/g," ").replace(/&nbsp;/gi," ").replace(/&amp;/gi,"&")
  .replace(/\s+/g," ").trim().slice(0,30000);
 }
+function tradeFromIdentity(name:string,domain:string,current?:string|null){
+ const x=(String(name||"")+" "+String(domain||"")).toLowerCase();const m:string[]=[];
+ if(x.includes("roof"))m.push("Roofing");if(x.includes("plumb"))m.push("Plumbing");if(x.includes("electric"))m.push("Electrical");
+ if(x.includes("hvac")||x.includes("heating")||x.includes("cooling")||x.includes("air conditioning"))m.push("HVAC");
+ if(x.includes("paint"))m.push("Painting");if(x.includes("fence"))m.push("Fence");if(x.includes("cabinet"))m.push("Cabinet");
+ const u=[...new Set(m)];if(current&&u.includes(String(current)))return String(current);return u.length===1?u[0]:null;
+}
 function links(html:string,base:string){
  const a:string[]=[];const re=/href=["']([^"'#]+)["']/gi;let m;
  while((m=re.exec(html))&&a.length<20){try{const u=new URL(m[1],base);if(u.protocol==="https:"&&u.hostname===new URL(base).hostname)a.push(u.toString())}catch{}}
@@ -66,7 +73,7 @@ Deno.serve(async req=>{
     for(const u of links(html,root.toString()).slice(0,10))if(!seen.has(u))urls.push(u);
    }catch{}
   }
-  const types=evidence(combined);const triggerRows=triggers(combined);
+  const types=evidence(combined);const triggerRows=triggers(combined);const identityTrade=company?tradeFromIdentity(company.name,company.canonical_domain,company.trade):null;
   if(company){
    await db.schema("booked_solid").from("companies").update({status:"researching",last_researched_at:new Date().toISOString()}).eq("id",company.id);
    for(const type of types){
@@ -80,7 +87,7 @@ Deno.serve(async req=>{
     company_id:company.id,email,email_confidence:60,source_url:root.toString(),status:"unverified"
    },{onConflict:"company_id,email"});
    for(const ph of foundPhones.values()){const {data:x}=await db.schema("booked_solid").from("contacts").select("id").eq("company_id",company.id).eq("phone",ph.phone).limit(1);if((x??[]).length)await db.schema("booked_solid").from("contacts").update({phone_type:"company_public",phone_confidence:72,phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",x![0].id);else await db.schema("booked_solid").from("contacts").insert({company_id:company.id,phone:ph.phone,phone_type:"company_public",phone_confidence:72,phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),status:"unverified"});}
-   await db.schema("booked_solid").from("companies").update({status:company.status==="qualified"?"qualified":"discovered",last_researched_at:new Date().toISOString(),last_enriched_at:new Date().toISOString(),enrichment_version:1,metadata:{...(company.metadata??{}),phones_found:foundPhones.size,trigger_types:triggerRows.map((x:any)=>x.type)}}).eq("id",company.id);
+   await db.schema("booked_solid").from("companies").update({status:company.status==="qualified"?"qualified":"discovered",last_researched_at:new Date().toISOString(),last_enriched_at:new Date().toISOString(),enrichment_version:1,...(identityTrade?{trade:identityTrade}:{}),metadata:{...(company.metadata??{}),phones_found:foundPhones.size,trigger_types:triggerRows.map((x:any)=>x.type)}}).eq("id",company.id);
   }
   return out({ok:true,url:root.toString(),pages_researched:pages,signals:types,triggers:triggerRows.map((x:any)=>({type:x.type,strength:x.strength})),emails_found:[...foundEmails].length,phones_found:foundPhones.size});
  }catch(e){console.error(e);return out({ok:false,error:String(e)},500)}
