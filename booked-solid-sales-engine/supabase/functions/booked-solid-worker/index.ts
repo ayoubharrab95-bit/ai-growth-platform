@@ -713,7 +713,7 @@ async function qualify(job:any){
  const evidenceScore=Math.min(18,realEvidence.length*3);
  const validContact=(ct??[]).find((x:any)=>x.email&&x.status!=="invalid"&&x.status!=="suppressed"&&mailboxKind(x.email)!=="weak");
  const contactScore=Math.min(20,Number(validContact?.email_confidence??0)/5);
- const score=Math.min(100,fit+pain+intentBonus+evidenceScore+contactScore);const opportunityScore=Math.round(Math.min(100,score*0.82+triggerScore*0.18));const priorityBand=triggerScore>=35&&opportunityScore>=75?"hot":opportunityScore>=70?"high":triggerScore>=20?"signal":"standard";
+ const score=Math.min(100,fit+pain+intentBonus+evidenceScore+contactScore);const opportunityScore=Math.round(Math.min(100,score*0.82+triggerScore*0.18));const priorityBand=triggerScore>=35&&opportunityScore>=80?"hot":opportunityScore>=70?"high":triggerScore>=20?"signal":"standard";
  let offer="custom_estimator";if(types.has("change_orders"))offer="penmark";else if(c.trade==="Property Operations")offer="automation";else if(types.has("estimation_pain")||types.has("field_quoting")||types.has("buyer_signal"))offer="custom_estimator";else if(types.has("recurring_contracts")||types.has("scale_signal")||types.has("workflow_complexity"))offer="automation";
  const hasPain=types.has("estimation_pain")||types.has("field_quoting")||types.has("change_orders");
  const prospectType=hasPain?"pain_led":"fit_led";
