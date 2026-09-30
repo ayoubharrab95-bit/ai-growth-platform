@@ -134,7 +134,6 @@ async function planCycle(body: any) {
   const { data: sources } = await db.schema("booked_solid").from("source_catalog").select("*").eq("enabled",true);
   const sourceBySlug=new Map((sources??[]).map((x:any)=>[x.slug,x]));
   const osmSource=sourceBySlug.get("openstreetmap_overpass");
-  const wikidataSource=sourceBySlug.get("wikidata_sparql");
   const nrcaSource=sourceBySlug.get("nrca_official");
   const chicagoPermitSource=sourceBySlug.get("chicago_building_permits");
   const nycPermitSource=sourceBySlug.get("nyc_dob_permits");
@@ -155,7 +154,6 @@ async function planCycle(body: any) {
     const useCount=Number(s.uses_count??0);
     let source:any=osmSource;
     if(autoActiveSources.length && useCount%10===8) source=autoActiveSources[(hashText(String(s.slug)+":"+useCount))%autoActiveSources.length];
-    else if(String(s.trade)==="Property Operations" && wikidataSource && useCount%3===2) source=wikidataSource;
     else if(s.target_location==="Chicago IL" && chicagoPermitSource && useCount%4===2) source=chicagoPermitSource;
     else if(s.target_location==="New York NY" && nycPermitSource && useCount%4===2) source=nycPermitSource;
     else if(s.target_location==="Austin TX" && austinPermitSource && useCount%4===2) source=austinPermitSource;
