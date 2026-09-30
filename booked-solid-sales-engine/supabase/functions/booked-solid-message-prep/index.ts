@@ -28,7 +28,11 @@ function utm(base:string,company:string,offer:string,seq:number,angle:string,lea
 }
 function evidenceTypes(rows:any[]){return new Set(rows.map(x=>String(x.evidence_type||"")))}
 function angleFor(types:Set<string>,trade:string){
- if(types.has("change_orders")) return "revenue_protection";
+ if(types.has("trigger_change_order_workflow")||types.has("change_orders")) return "revenue_protection";
+ if(types.has("trigger_manual_workflow")) return "operational_leverage";
+ if(types.has("trigger_hiring_estimator")||types.has("trigger_active_hiring")) return "capacity_without_more_admin";
+ if(types.has("trigger_quote_speed")) return "speed_to_quote";
+ if(types.has("trigger_expansion")||types.has("trigger_multi_location_growth")) return "consistency_at_scale";
  if(trade==="Property Operations" && (types.has("workflow_complexity")||types.has("property_operations"))) return "operational_leverage";
  if(types.has("buyer_signal")) return "capacity_without_more_admin";
  if(types.has("field_quoting")) return "speed_to_quote";
@@ -44,6 +48,15 @@ function offerKeyFor(lead:any,types:Set<string>,trade:string){
  return lead.offer==="automation"?"automation":lead.offer==="penmark"?"penmark":"custom_estimator";
 }
 function observationFor(types:Set<string>,trade:string,company:string,evidence:any[]){
+ const trigger=evidence.filter(x=>String(x.evidence_type||"").startsWith("trigger_")).sort((a,b)=>Number(b.metadata?.trigger_strength||0)-Number(a.metadata?.trigger_strength||0))[0];
+ if(trigger?.evidence_type==="trigger_hiring_estimator") return "I noticed "+company+" appears to be adding capacity around estimating or project delivery, which is usually when quote prep and handoffs start taking more admin time.";
+ if(trigger?.evidence_type==="trigger_expansion") return "I noticed public signs that "+company+" is expanding its footprint, which can make consistent estimating and handoffs harder to maintain across more work.";
+ if(trigger?.evidence_type==="trigger_manual_workflow") return "I noticed public references to a manual or spreadsheet-heavy workflow around the operation.";
+ if(trigger?.evidence_type==="trigger_multi_location_growth") return "I noticed "+company+" appears to operate across multiple locations or regions, where keeping workflows consistent can get harder as volume grows.";
+ if(trigger?.evidence_type==="trigger_quote_speed") return "I noticed "+company+" emphasizes fast estimates or quotes, so reducing the manual steps behind that process may be especially useful.";
+ if(trigger?.evidence_type==="trigger_change_order_workflow") return "I noticed change orders or scope changes are part of the workflow, where clean approvals and updated job value can protect margin.";
+ if(trigger?.evidence_type==="trigger_recurring_service") return "I noticed "+company+" has recurring service or maintenance workflows, which often create repetitive admin and follow-up work.";
+ if(trigger?.evidence_type==="trigger_active_hiring") return "I noticed "+company+" is actively hiring, which can be a sign the team is adding capacity and operational workload.";
  const permit=evidence.find(x=>x.evidence_type==="permit_activity");
  const assoc=evidence.find(x=>x.evidence_type==="association_membership");
  if(permit) return "I came across recent permit activity tied to "+company+", which usually means the estimating and handoff process has to stay tight as projects move.";
@@ -205,6 +218,12 @@ Deno.serve(async req=>{
   }
 
   const types=evidenceTypes(evidence||[]);
+  const evidenceSeen=new Set<string>();
+  const rankedEvidence=[...(evidence||[])].sort((a:any,b:any)=>{
+   const at=String(a.evidence_type||"").startsWith("trigger_")?1:0,bt=String(b.evidence_type||"").startsWith("trigger_")?1:0;
+   if(at!==bt)return bt-at;
+   return Number(b.metadata?.trigger_strength||b.confidence||0)-Number(a.metadata?.trigger_strength||a.confidence||0);
+  }).filter((x:any)=>{const k=String(x.evidence_type||"")+"|"+String(x.source_url||"");if(evidenceSeen.has(k))return false;evidenceSeen.add(k);return true;});
   const angle=angleFor(types,company.trade||"");
   const offerKey=offerKeyFor(lead,types,company.trade||"");
   const {data:offer,error:oe}=await db.schema("booked_solid").from("offer_catalog").select("*").eq("offer_key",offerKey).eq("enabled",true).single();
@@ -241,9 +260,9 @@ Deno.serve(async req=>{
     message_version:"psych_v2",
     status:runtime?.email_enabled?"ready":"blocked_email_not_configured",
     scheduled_at:timing.iso,
-    personalization_evidence:(evidence||[]).slice(0,8).map((x:any)=>({type:x.evidence_type,claim:x.claim,url:x.source_url,confidence:x.confidence})),
+    personalization_evidence:rankedEvidence.slice(0,8).map((x:any)=>({type:x.evidence_type,claim:x.claim,url:x.source_url,confidence:x.confidence,trigger_strength:x.metadata?.trigger_strength??null})),
     stop_conditions:{reply:true,booking:true,unsubscribe:true,hard_bounce:true},
-    metadata:{offer_key:offerKey,contact_source:contact.source,contact_role:contact.role||null,contact_score:Number(contact.score||lead.lead_brief?.contact_resolution?.score||0),contact_class:contact.contact_class||lead.lead_brief?.contact_resolution?.contact_class||null,contact_risk:isSuspicious(contact.email)?"suspicious":isWeak(contact.email)?"weak_function_inbox":localPart(contact.email).length<=2?"short_local_part":isGeneric(contact.email)?"generic":"normal",company_trade:company.trade,source_first_seen:company.source_first_seen,recipient_utc_offset:timing.offset,schedule_policy:"weekday_0917_local_approx"}
+    metadata:{offer_key:offerKey,contact_source:contact.source,contact_role:contact.role||null,contact_score:Number(contact.score||lead.lead_brief?.contact_resolution?.score||0),contact_class:contact.contact_class||lead.lead_brief?.contact_resolution?.contact_class||null,contact_risk:isSuspicious(contact.email)?"suspicious":isWeak(contact.email)?"weak_function_inbox":localPart(contact.email).length<=2?"short_local_part":isGeneric(contact.email)?"generic":"normal",trigger_score:Number(lead.trigger_score||0),opportunity_score:Number(lead.opportunity_score||0),priority_band:lead.priority_band||"standard",phone_available:Boolean(lead.lead_brief?.contact_resolution?.phone),sms_eligible:Boolean(lead.lead_brief?.contact_resolution?.sms_eligible===true),sms_sending_enabled:false,company_trade:company.trade,source_first_seen:company.source_first_seen,recipient_utc_offset:timing.offset,schedule_policy:"weekday_0917_local_approx"}
    });
   }
 
