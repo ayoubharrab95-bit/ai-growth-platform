@@ -6,11 +6,56 @@ const out=(x:unknown,s=200)=>new Response(JSON.stringify(x),{status:s,headers:H}
 function domainOf(raw:string){try{return new URL(raw).hostname.replace(/^www\./,"").toLowerCase()}catch{return null}}
 function normalize(s:string){return s.toLowerCase().replace(/[^a-z0-9]+/g," ").trim()}
 function clean(html:string){return html.replace(/<script[\s\S]*?<\/script>/gi," ").replace(/<style[\s\S]*?<\/style>/gi," ").replace(/<[^>]+>/g," ").replace(/&nbsp;/gi," ").replace(/&amp;/gi,"&").replace(/\s+/g," ").trim().slice(0,30000)}
+function normalizeUSPhone(raw:string){
+ let s=String(raw||"").replace(/(?:ext\.?|extension|x)\s*\d{1,6}\s*$/i,"");
+ let d=s.replace(/\D/g,"");if(d.length===11&&d.startsWith("1"))d=d.slice(1);
+ if(d.length!==10)return null;
+ const area=Number(d.slice(0,3)),exchange=Number(d.slice(3,6));
+ if(area<200||exchange<200)return null;
+ return "+1"+d;
+}
+function extractPhoneCandidates(text:string,sourceUrl:string,pagePath:string){
+ const rx=/(?:\+?1[\s.\-()]*)?(?:\(?\d{3}\)?[\s.\-]*)\d{3}[\s.\-]*\d{4}(?:\s*(?:x|ext\.?|extension)\s*\d{1,6})?/gi;
+ const found:any[]=[];let m:RegExpExecArray|null;
+ while((m=rx.exec(String(text||"")))){
+  const before=String(text||"").slice(Math.max(0,m.index-40),m.index).toLowerCase();
+  if(/fax\s*[:#-]?\s*$/.test(before))continue;
+  const phone=normalizeUSPhone(m[0]);if(!phone)continue;
+  found.push({phone,phone_type:"company_public",phone_confidence:pagePath==="/contact"?82:72,phone_source_url:sourceUrl});
+ }
+ return found;
+}
+function detectPainTriggers(text:string){
+ const s=String(text||"");
+ const rules:any[]=[
+  ["trigger_hiring_estimator",35,/\b(?:now hiring|we(?:'re| are) hiring|join our team|open positions?|apply (?:now|today)|careers?)\b[\s\S]{0,220}\b(?:estimator|estimating|preconstruction|project manager)\b|\b(?:estimator|estimating manager|preconstruction estimator)\b[\s\S]{0,220}\b(?:hiring|apply|career|position)\b/i,"Public site shows active hiring/capacity signals around estimating or project delivery."],
+  ["trigger_expansion",28,/\b(?:expanding|expanded|new location|new office|new branch|recently opened|opening (?:a|our|new)|now serving)\b/i,"Public site shows an expansion or new-market signal."],
+  ["trigger_manual_workflow",30,/\b(?:spreadsheets?|excel|paper forms?|manual process|manual entry|manually enter|re-?enter(?:ing)? data)\b/i,"Public site contains signs of a manual or spreadsheet-heavy workflow."],
+  ["trigger_multi_location_growth",18,/\b(?:multiple locations|several locations|locations across|branch locations|multiple branches|regional offices)\b/i,"Public site shows multi-location or regional operating complexity."],
+  ["trigger_quote_speed",18,/\b(?:same[- ]day estimate|instant estimate|instant quote|fast quote|quick estimate|on[- ]site quote)\b/i,"Public site emphasizes quote or estimate speed."],
+  ["trigger_change_order_workflow",22,/\b(?:change orders?|change-order|scope changes?|additional work authorization)\b/i,"Public site references change-order or scope-change workflow."],
+  ["trigger_recurring_service",12,/\b(?:maintenance agreement|service agreement|maintenance contract|service contract|membership plan)\b/i,"Public site shows recurring service/maintenance workflows."],
+  ["trigger_active_hiring",12,/\b(?:now hiring|we(?:'re| are) hiring|join our team|open positions?|apply today)\b/i,"Public site shows active hiring, a possible capacity signal."]
+ ];
+ const out=rules.filter((x:any)=>x[2].test(s)).map((x:any)=>({type:x[0],strength:x[1],claim:x[3]}));
+ return out.some((x:any)=>x.type==="trigger_hiring_estimator")?out.filter((x:any)=>x.type!=="trigger_active_hiring"):out;
+}
+function computeTriggerSummary(rows:any[]){
+ const best=new Map<string,any>();
+ for(const r of rows||[]){
+  const type=String(r.evidence_type||"");if(!type.startsWith("trigger_"))continue;
+  const strength=Number(r.metadata?.trigger_strength??0),prev=best.get(type);
+  if(!prev||strength>Number(prev.metadata?.trigger_strength??0))best.set(type,r);
+ }
+ const items=[...best.values()].sort((a:any,b:any)=>Number(b.metadata?.trigger_strength??0)-Number(a.metadata?.trigger_strength??0));
+ return {score:Math.min(100,items.reduce((n:number,x:any)=>n+Number(x.metadata?.trigger_strength??0),0)),items,strongest:items[0]??null};
+}
+
 function mailboxKind(email:string){
  const lp=String(email||"").toLowerCase().split("@")[0];
  if(!lp)return "missing";
  if(lp.length<2||["first","firstname","test","example"].includes(lp))return "weak";
- if(/(employment|careers?|jobs?|support|concierge|reservations?|dining|spa|events?|groups?|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)/.test(lp)||/^(hr)$/.test(lp))return "weak";
+ if(/(employment|careers?|jobs?|recruiting|recruitment|talent|support|concierge|reservations?|dining|spa|events?|groups?|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)/.test(lp)||/^(hr)$/.test(lp))return "weak";
  if(/^(info|office|admin|hello|contact|sales|marketing|service|team|inquiries|inquiry|reception|frontdesk|estimates?|estimating|quotes?|build|projects?)$/.test(lp))return "generic";
  return "direct";
 }
@@ -55,6 +100,22 @@ async function findPublicNamedEmail(company:any,person:any,contacts:any[]){
    const emails=[...new Set(hay.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[])].map((e:string)=>e.toLowerCase());
    const match=emails.find((e:string)=>{const ed=e.split("@")[1];return (ed===domain||ed.endsWith("."+domain))&&mailboxKind(e)==="direct"&&emailMatchesName(e,person.full_name)});
    if(match)return match;
+ }
+ return null;
+}
+async function findPublicNamedPhone(company:any,person:any){
+ if(!company?.website_url||!person?.full_name)return null;
+ let root:URL;try{root=new URL(company.website_url)}catch{return null}
+ for(const p of ["/about","/team","/our-team","/leadership","/contact"]){
+  try{
+   const url=new URL(p,root).toString();
+   const r=await fetch(url,{redirect:"follow",signal:AbortSignal.timeout(5000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});
+   if(!r.ok)continue;const visible=clean(await r.text());
+   const low=visible.toLowerCase(),needle=String(person.full_name).toLowerCase(),idx=low.indexOf(needle);if(idx<0)continue;
+   const window=visible.slice(Math.max(0,idx-220),Math.min(visible.length,idx+needle.length+320));
+   const phones=extractPhoneCandidates(window,url,p);
+   if(phones.length)return {...phones[0],phone_type:"decision_maker_public",phone_confidence:85};
+  }catch{}
  }
  return null;
 }
@@ -494,9 +555,9 @@ async function research(job:any){
  const {data:c,error}=await db.schema("booked_solid").from("companies").select("*").eq("id",job.payload.company_id).single();if(error)throw error;
  const root=new URL(c.website_url);if(root.protocol!=="https:")throw new Error("HTTPS_REQUIRED");
  const paths=["/","/about","/services","/contact","/team","/estimate","/careers","/locations","/commercial"];
- let combined="";let pages=0;const emails=new Set<string>();
- const pageResults=await Promise.all(paths.map(async p=>{try{const r=await fetch(new URL(p,root),{redirect:"follow",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});if(!r.ok)return null;const h=await r.text();return {p,h,visible:clean(h)};}catch{return null;}}));
- for(const pg of pageResults){if(!pg)continue;pages++;combined+=" "+pg.visible;for(const e of pg.visible.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[]){const em=e.toLowerCase();const ed=em.split("@")[1];const hd=root.hostname.toLowerCase().replace(/^www\./,"");if(ed===hd||ed.endsWith("."+hd))emails.add(em);}}
+ let combined="";let pages=0;const emails=new Set<string>();const phones=new Map<string,any>();
+ const pageResults=await Promise.all(paths.map(async p=>{try{const r=await fetch(new URL(p,root),{redirect:"follow",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});if(!r.ok)return null;const h=await r.text();return {p,h,url:new URL(p,root).toString(),visible:clean(h)};}catch{return null;}}));
+ for(const pg of pageResults){if(!pg)continue;pages++;combined+=" "+pg.visible;for(const e of pg.visible.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[]){const em=e.toLowerCase();const ed=em.split("@")[1];const hd=root.hostname.toLowerCase().replace(/^www\./,"");if(ed===hd||ed.endsWith("."+hd))emails.add(em);}for(const ph of extractPhoneCandidates(pg.visible,pg.url,pg.p)){const prev=phones.get(ph.phone);if(!prev||Number(ph.phone_confidence)>Number(prev.phone_confidence))phones.set(ph.phone,ph);}}
  const home=pageResults.find((x:any)=>x?.p==="/");if(home){const mt=String(home.h).match(/<title[^>]*>([\s\S]*?)<\/title>/i);const ht=mt?clean(mt[1]).replace(/\s*[|–-]\s*.*$/,"").trim():"";const weak=/^(estimator|careers?|jobs?|free estimate|request a quote|home)$/i.test(String(c.name||""));if(ht&&ht.length>=3&&ht.length<120&&(weak||!c.name)){await db.schema("booked_solid").from("companies").update({name:ht,normalized_name:normalize(ht)}).eq("id",c.id);c.name=ht;}}
  const domain=root.hostname.replace(/^www\./,"").toLowerCase();
  const missingName=!c.name||/^free |^do |^how |^what |^the best|^best /i.test(c.name);
@@ -507,12 +568,12 @@ async function research(job:any){
  }
  for(const x of supplemental){const u=String(x.url??"");const txt=String(x.title??"")+" "+String(x.content??"");for(const e of txt.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[]){const em=e.toLowerCase();const ed=em.split("@")[1];if(ed===domain||ed.endsWith("."+domain))emails.add(em);}await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:"supplemental_search",claim:String(x.title??"Supplemental search result"),snippet:String(x.content??"").slice(0,1200),source_url:u||null,confidence:45,metadata:{provider:"tavily",query_type:"gap_fill"}});}
  if(pages===0&&!supplemental.length){await db.schema("booked_solid").from("companies").update({status:"rejected"}).eq("id",c.id);return {pages,signals:[],emails:0,rejected:"no_reachable_pages"};}
- const supplementalText=supplemental.map(x=>x.content??"").join(" ");const allText=combined+" "+supplementalText;if(!c.trade){const inferred=inferSiteTrade(allText);if(inferred){await db.schema("booked_solid").from("companies").update({trade:inferred,updated_at:new Date().toISOString(),metadata:{...(c.metadata??{}),trade_inferred_from_site:true}}).eq("id",c.id);c.trade=inferred;}}const types=signalTypes(allText);const associationMatch=await verifyAssociation(c);if(associationMatch)types.push("association_membership");
- for(const t of types.filter((x:string)=>x!=="association_membership"))await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:t,claim:"Public sources contain signals related to "+t,snippet:allText.slice(0,1200),source_url:root.toString(),confidence:70,metadata:{pages_researched:pages,supplemental_results:supplemental.length}});
- for(const email of emails){const {data:existingContact}=await db.schema("booked_solid").from("contacts").select("id").eq("company_id",c.id).eq("email",email).maybeSingle();if(existingContact)await db.schema("booked_solid").from("contacts").update({email_confidence:75,source_url:root.toString(),status:"unverified"}).eq("id",existingContact.id);else await db.schema("booked_solid").from("contacts").insert({company_id:c.id,email,email_confidence:75,source_url:root.toString(),status:"unverified"});}
- await db.schema("booked_solid").from("companies").update({last_researched_at:new Date().toISOString(),status:c.metadata?.hard_excluded_vendor?"rejected":c.status==="qualified"?"qualified":"discovered",metadata:{...(c.metadata??{}),research_pages:pages,supplemental_searches:supplemental.length}}).eq("id",c.id);
+ const supplementalText=supplemental.map(x=>x.content??"").join(" ");const allText=combined+" "+supplementalText;if(!c.trade){const inferred=inferSiteTrade(allText);if(inferred){await db.schema("booked_solid").from("companies").update({trade:inferred,updated_at:new Date().toISOString(),metadata:{...(c.metadata??{}),trade_inferred_from_site:true}}).eq("id",c.id);c.trade=inferred;}}const types=signalTypes(allText);const triggers=detectPainTriggers(allText);const associationMatch=await verifyAssociation(c);if(associationMatch)types.push("association_membership");
+ for(const t of types.filter((x:string)=>x!=="association_membership"))await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:t,claim:"Public sources contain signals related to "+t,snippet:allText.slice(0,1200),source_url:root.toString(),confidence:70,metadata:{pages_researched:pages,supplemental_results:supplemental.length}});for(const tr of triggers){const {data:et}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",c.id).eq("evidence_type",tr.type).eq("source_url",root.toString()).limit(1);if((et??[]).length)await db.schema("booked_solid").from("evidence").update({claim:tr.claim,snippet:allText.slice(0,1200),confidence:80,observed_at:new Date().toISOString(),metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}}).eq("id",et![0].id);else await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:tr.type,claim:tr.claim,snippet:allText.slice(0,1200),source_url:root.toString(),confidence:80,metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}});}
+ for(const email of emails){const {data:existingContact}=await db.schema("booked_solid").from("contacts").select("id").eq("company_id",c.id).eq("email",email).maybeSingle();if(existingContact)await db.schema("booked_solid").from("contacts").update({email_confidence:75,source_url:root.toString(),status:"unverified"}).eq("id",existingContact.id);else await db.schema("booked_solid").from("contacts").insert({company_id:c.id,email,email_confidence:75,source_url:root.toString(),status:"unverified"});}for(const ph of phones.values()){const {data:ep}=await db.schema("booked_solid").from("contacts").select("id,phone_confidence").eq("company_id",c.id).eq("phone",ph.phone).limit(1);if((ep??[]).length)await db.schema("booked_solid").from("contacts").update({phone_type:ph.phone_type,phone_confidence:Math.max(Number(ep![0].phone_confidence||0),Number(ph.phone_confidence||0)),phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",ep![0].id);else await db.schema("booked_solid").from("contacts").insert({company_id:c.id,phone:ph.phone,phone_type:ph.phone_type,phone_confidence:ph.phone_confidence,phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),status:"unverified"});}
+ await db.schema("booked_solid").from("companies").update({last_researched_at:new Date().toISOString(),last_enriched_at:new Date().toISOString(),enrichment_version:1,status:c.metadata?.hard_excluded_vendor?"rejected":c.status==="qualified"?"qualified":"discovered",metadata:{...(c.metadata??{}),research_pages:pages,supplemental_searches:supplemental.length,phones_found:phones.size,trigger_types:triggers.map((x:any)=>x.type)}}).eq("id",c.id);
  await db.schema("booked_solid").from("work_queue").insert({kind:"qualify",priority:Number(job.priority)+5,payload:{company_id:c.id,strategy_id:job.payload.strategy_id},status:"pending"});
- return {pages,signals:types,emails:emails.size,supplemental_results:supplemental.length,gap_fill_used:missingName||missingContact||combined.length<500};
+ return {pages,signals:types,triggers:triggers.map((x:any)=>({type:x.type,strength:x.strength})),emails:emails.size,phones:phones.size,supplemental_results:supplemental.length,gap_fill_used:missingName||missingContact||combined.length<500};
 }
 
 async function contactResolve(job:any){
@@ -560,6 +621,13 @@ async function contactResolve(job:any){
    }
  }
 
+ if(decision && !decision.phone){
+   const namedPhone=await findPublicNamedPhone(company,decision);
+   if(namedPhone){
+     await db.schema("booked_solid").from("contacts").update({phone:namedPhone.phone,phone_type:namedPhone.phone_type,phone_confidence:namedPhone.phone_confidence,phone_source_url:namedPhone.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",decision.id);
+     decision.phone=namedPhone.phone;decision.phone_type=namedPhone.phone_type;decision.phone_confidence=namedPhone.phone_confidence;decision.phone_source_url=namedPhone.phone_source_url;decision.sms_consent_status="unknown";decision.sms_eligible=false;
+   }
+ }
  const usable=contacts.filter((x:any)=>x.email&&mailboxKind(x.email)!=="weak");
  const directNamed=usable.filter((x:any)=>x.full_name&&decisionRoleScore(x.role)>0&&mailboxKind(x.email)==="direct").sort((a:any,b:any)=>(contactResolutionScore(b)-contactResolutionScore(a))||(decisionRoleScore(b.role)-decisionRoleScore(a.role)))[0];
  const directAny=usable.filter((x:any)=>mailboxKind(x.email)==="direct").sort((a:any,b:any)=>contactResolutionScore(b)-contactResolutionScore(a))[0];
@@ -572,9 +640,15 @@ async function contactResolve(job:any){
  else if(generic){chosen=generic;namedContact=null;contactClass="generic_only";score=55;}
 
  const weakOnly=!chosen&&contacts.some((x:any)=>x.email&&mailboxKind(x.email)==="weak");
+ const phoneContacts=contacts.filter((x:any)=>x.phone&&x.phone_status!=="invalid");
+ const decisionPhone=phoneContacts.filter((x:any)=>x.full_name&&decisionRoleScore(x.role)>0&&x.phone_type==="decision_maker_public").sort((a:any,b:any)=>Number(b.phone_confidence||0)-Number(a.phone_confidence||0))[0];
+ const chosenPhone=decisionPhone??(chosen?.phone?chosen:phoneContacts.sort((a:any,b:any)=>Number(b.phone_confidence||0)-Number(a.phone_confidence||0))[0]??null);
  const state=chosen?"ready":weakOnly?"weak_only":"contact_required";
  const retryCount=Number(job.payload?.contact_retry??0);
  const nextRetryAt=!chosen&&retryCount<3?new Date(Date.now()+72*3600000).toISOString():null;
+ const phoneScore=chosenPhone?(chosenPhone.phone_type==="decision_maker_public"?100:60):0;
+ const updatedOpportunity=Math.round(Math.min(100,Number(lead.score||0)*0.65+Number(lead.trigger_score||0)*0.20+score*0.10+phoneScore*0.05));
+ const updatedPriorityBand=Number(lead.trigger_score||0)>=35&&updatedOpportunity>=80?"hot":updatedOpportunity>=70?"high":Number(lead.trigger_score||0)>=20?"signal":"standard";
  const resolution={
    state,contact_class:contactClass,score,retry_count:retryCount,next_retry_at:nextRetryAt,
    recipient_email:chosen?.email?String(chosen.email).toLowerCase():null,
@@ -583,13 +657,20 @@ async function contactResolve(job:any){
    contact_id:namedContact?.id||chosen?.id||null,
    email_contact_id:chosen?.id||null,
    email_kind:chosen?.email?mailboxKind(chosen.email):null,
+   phone:chosenPhone?.phone||null,
+   phone_type:chosenPhone?.phone_type||null,
+   phone_confidence:Number(chosenPhone?.phone_confidence||0),
+   phone_source_url:chosenPhone?.phone_source_url||null,
+   sms_consent_status:chosenPhone?.sms_consent_status||"unknown",
+   sms_eligible:Boolean(chosenPhone?.sms_eligible===true),
+   sms_sending_enabled:false,
    decision_maker_known:Boolean(decision),
    decision_maker_name:decision?.full_name||null,
    decision_maker_role:decision?.role||null,
    resolved_at:new Date().toISOString(),
    candidate_summary:contacts.map((x:any)=>({id:x.id,name:x.full_name||null,role:x.role||null,email:x.email||null,email_kind:x.email?mailboxKind(x.email):"missing",score:contactResolutionScore(x)})).sort((a:any,b:any)=>b.score-a.score).slice(0,8)
  };
- await db.schema("booked_solid").from("leads").update({contact_id:resolution.contact_id,contact_score:score,lead_brief:{...(lead.lead_brief||{}),contact_resolution:resolution},updated_at:new Date().toISOString()}).eq("id",lead.id);
+ await db.schema("booked_solid").from("leads").update({contact_id:resolution.contact_id,contact_score:score,opportunity_score:updatedOpportunity,priority_band:updatedPriorityBand,lead_brief:{...(lead.lead_brief||{}),contact_resolution:resolution,opportunity:{score:updatedOpportunity,priority_band:updatedPriorityBand,trigger_score:Number(lead.trigger_score||0),contact_score:score,phone_score:phoneScore,ranking_only:true,never_a_qualification_gate:true,updated_at:new Date().toISOString()}},updated_at:new Date().toISOString()}).eq("id",lead.id);
 
  if(!chosen){
    await db.schema("booked_solid").from("outreach_queue").update({status:"cancelled",failure_reason:weakOnly?"Contact resolution: only weak-function inboxes available.":"Contact resolution: no usable email found."}).eq("lead_id",lead.id).in("status",["blocked_email_not_configured","ready"]);
@@ -597,7 +678,7 @@ async function contactResolve(job:any){
    return {lead_id:lead.id,company:company.name,...resolution,queued_message:false,retry_scheduled:Boolean(nextRetryAt)};
  }
  const {data:mq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","message").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
- if(!(mq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"message",priority:Number(lead.score||0)+score/10,payload:{lead_id:lead.id},status:"pending"});
+ if(!(mq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"message",priority:Number(lead.score||0)+score/10+Math.min(10,Number(lead.trigger_score||0)*0.10),payload:{lead_id:lead.id},status:"pending"});
  return {lead_id:lead.id,company:company.name,...resolution,queued_message:true};
 }
 async function qualify(job:any){
@@ -610,7 +691,7 @@ async function qualify(job:any){
   db.schema("booked_solid").from("runtime_settings").select("*").eq("id",true).single()
  ]);
  if(ce)throw ce;if(ee)throw ee;if(te)throw te;if(lee)throw lee;if(se)throw se;
- const rows=ev??[];const types=new Set(rows.map((x:any)=>x.evidence_type));
+ const rows=ev??[];const types=new Set(rows.map((x:any)=>x.evidence_type));const triggerSummary=computeTriggerSummary(rows);const triggerScore=triggerSummary.score;
  const domain=String(c.canonical_domain||"").toLowerCase();const name=String(c.name||"");
  const badDomain=Boolean(c.metadata?.hard_excluded_source)||/reddit\.com|youtube\.com|quora\.com|facebook\.com|instagram\.com|tiktok\.com|linkedin\.com|usatoday\.com|forbes\.com|yelp\.com|angi\.com|homeadvisor\.com|thumbtack\.com|porch\.com|houzz\.com|indeed\.com|ziprecruiter\.com|glassdoor\.com|monster\.com|careerbuilder\.com|simplyhired\.com|zippia\.com|talent\.com|jooble\.org|builtin\.com|bebee\.com|vaia\.com|theladders\.com|icims\.com|jobleads\.com|lever\.co|greenhouse\.io|greenhouse\.com|workable\.com|smartrecruiters\.com|ashbyhq\.com|bamboohr\.com|myquoteiq\.com|buildium\.com|funnelleasing\.com|secondnature\.com|sharefile\.com/i.test(domain);
  const badTitle=/\b(directory|directories|database|guide|best \d+|\d+ best|how to|what is|what are|do .* offer|news|magazine|article|review|reviews|jobs? in|project manager jobs|estimator jobs|recruiter|recruiting|staffing|talent acquisition|top \d+ crms?|\d+\s+ways\b|ways .* automation|ways to use automation|tasks to save time|client portals? for contractors)\b/i.test(name);const leadgenTitle=/^(get|request|compare|find)\b.*\b(estimate|estimates|quote|quotes)\b/i.test(name);
@@ -632,32 +713,32 @@ async function qualify(job:any){
  const evidenceScore=Math.min(18,realEvidence.length*3);
  const validContact=(ct??[]).find((x:any)=>x.email&&x.status!=="invalid"&&x.status!=="suppressed"&&mailboxKind(x.email)!=="weak");
  const contactScore=Math.min(20,Number(validContact?.email_confidence??0)/5);
- const score=Math.min(100,fit+pain+intentBonus+evidenceScore+contactScore);
+ const score=Math.min(100,fit+pain+intentBonus+evidenceScore+contactScore);const opportunityScore=Math.round(Math.min(100,score*0.82+triggerScore*0.18));const priorityBand=triggerScore>=35&&opportunityScore>=75?"hot":opportunityScore>=70?"high":triggerScore>=20?"signal":"standard";
  let offer="custom_estimator";if(types.has("change_orders"))offer="penmark";else if(c.trade==="Property Operations")offer="automation";else if(types.has("estimation_pain")||types.has("field_quoting")||types.has("buyer_signal"))offer="custom_estimator";else if(types.has("recurring_contracts")||types.has("scale_signal")||types.has("workflow_complexity"))offer="automation";
  const hasPain=types.has("estimation_pain")||types.has("field_quoting")||types.has("change_orders");
  const prospectType=hasPain?"pain_led":"fit_led";
  const priorQualified=(existingLeads??[]).find((x:any)=>x.status==="qualified");
  let status=priorQualified?"qualified":score>=65&&realEvidence.length>=1?"qualified":score>=40?"candidate":"rejected";
- const why=prospectType==="pain_led"?"Public evidence shows a relevant operational/estimating signal.":"Company appears to fit Booked Solid's target customer profile; no pain is assumed.";
+ const why=triggerSummary.strongest?.claim||(prospectType==="pain_led"?"Public evidence shows a relevant operational/estimating signal.":"Company appears to fit Booked Solid's target customer profile; no pain is assumed.");
  if(status==="rejected"){
   await db.schema("booked_solid").from("companies").update({status:"rejected",recommended_offer:null,updated_at:new Date().toISOString()}).eq("id",id);
   for(const l of (existingLeads??[]).filter((x:any)=>x.status!=="won"))await db.schema("booked_solid").from("leads").update({status:"suppressed",why_now:why,updated_at:new Date().toISOString()}).eq("id",l.id);
   await updateStrategyLearning(job.payload.strategy_id,20,false);return {score,offer,status,prospect_type:prospectType,contact_found:!!validContact};
  }
- const priorBrief=(priorQualified??(existingLeads??[])[0])?.lead_brief??{};const leadPayload={company_id:id,contact_id:validContact?.id??null,strategy_id:job.payload.strategy_id??null,offer,score,fit_score:fit,pain_score:pain,evidence_score:evidenceScore,contact_score:contactScore,status,why_now:why,lead_brief:{...priorBrief,prospect_type:prospectType,evidence_types:[...types],company:c.name,website:c.website_url,contact_status:validContact?"unverified":"missing"}};
+ const priorBrief=(priorQualified??(existingLeads??[])[0])?.lead_brief??{};const leadPayload={company_id:id,contact_id:validContact?.id??null,strategy_id:job.payload.strategy_id??null,offer,score,fit_score:fit,pain_score:pain,evidence_score:evidenceScore,contact_score:contactScore,trigger_score:triggerScore,opportunity_score:opportunityScore,priority_band:priorityBand,status,why_now:why,lead_brief:{...priorBrief,prospect_type:prospectType,evidence_types:[...types],company:c.name,website:c.website_url,contact_status:validContact?"unverified":"missing",trigger_summary:{score:triggerScore,types:triggerSummary.items.map((x:any)=>x.evidence_type),strongest_type:triggerSummary.strongest?.evidence_type||null,strongest_claim:triggerSummary.strongest?.claim||null,updated_at:new Date().toISOString()},micro_audit:{headline:triggerSummary.strongest?.claim||why,findings:triggerSummary.items.slice(0,3).map((x:any)=>({type:x.evidence_type,claim:x.claim,source_url:x.source_url,confidence:x.confidence})),generated_from_public_evidence:true}}};
  const existing=priorQualified??(existingLeads??[]).find((x:any)=>x.offer===offer)??(existingLeads??[])[0];let lead:any;
  if(existing){const {data:u,error:ue}=await db.schema("booked_solid").from("leads").update(leadPayload).eq("id",existing.id).select("*").single();if(ue)throw ue;lead=u;}
  else{const {data:i,error:ie}=await db.schema("booked_solid").from("leads").insert(leadPayload).select("*").single();if(ie)throw ie;lead=i;}
  if(status==="qualified"){
   const {data:cq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","contact").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
-  if(!(cq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:score+10,payload:{lead_id:lead.id,company_id:id},status:"pending"});
+  if(!(cq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:score+10+Math.min(15,triggerScore*0.15),payload:{lead_id:lead.id,company_id:id},status:"pending"});
   await db.schema("booked_solid").from("companies").update({status:"qualified",recommended_offer:offer,fit_score:fit,updated_at:new Date().toISOString()}).eq("id",id);
   await updateStrategyLearning(job.payload.strategy_id,90,!priorQualified);
  }else{
   await db.schema("booked_solid").from("companies").update({status:"discovered",recommended_offer:offer,fit_score:fit,updated_at:new Date().toISOString()}).eq("id",id);
   await updateStrategyLearning(job.payload.strategy_id,50,false);
  }
- return {score,offer,status,prospect_type:prospectType,contact_found:!!validContact,email_enabled:!!settings?.email_enabled,intent_bonus:intentBonus};
+ return {score,offer,status,prospect_type:prospectType,contact_found:!!validContact,email_enabled:!!settings?.email_enabled,intent_bonus:intentBonus,trigger_score:triggerScore,opportunity_score:opportunityScore,priority_band:priorityBand};
 }
 async function message(job:any){
  const url=Deno.env.get("SUPABASE_URL")!+"/functions/v1/booked-solid-message-prep";
