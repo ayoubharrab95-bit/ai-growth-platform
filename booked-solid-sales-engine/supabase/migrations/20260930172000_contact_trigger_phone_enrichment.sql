@@ -43,10 +43,42 @@ where id=true;
 update booked_solid.leads
 set opportunity_score=round(least(100::numeric, score*0.82 + trigger_score*0.18)),
     priority_band=case
-      when trigger_score>=35 and round(least(100::numeric, score*0.82 + trigger_score*0.18))>=75 then 'hot'
+      when trigger_score>=35 and round(least(100::numeric, score*0.82 + trigger_score*0.18))>=80 then 'hot'
       when round(least(100::numeric, score*0.82 + trigger_score*0.18))>=70 then 'high'
       when trigger_score>=20 then 'signal'
       else 'standard'
     end,
     updated_at=now()
 where status in ('qualified','candidate');
+
+
+-- If an existing database already has contact-resolution data, preserve its
+-- richer ranking by incorporating the resolved contact and phone components.
+with calc as (
+  select id,score,trigger_score,
+         coalesce(nullif(lead_brief->'contact_resolution'->>'score','')::numeric,0) contact_component,
+         case
+           when coalesce(lead_brief->'contact_resolution'->>'phone','')='' then 0
+           when lead_brief->'contact_resolution'->>'phone_type'='decision_maker_public' then 100
+           else 60
+         end phone_component
+  from booked_solid.leads
+  where status in ('qualified','candidate')
+    and lead_brief ? 'contact_resolution'
+),
+scored as (
+  select id,trigger_score,
+         round(least(100::numeric,score*0.65 + trigger_score*0.20 + contact_component*0.10 + phone_component*0.05)) opp
+  from calc
+)
+update booked_solid.leads l
+set opportunity_score=s.opp,
+    priority_band=case
+      when s.trigger_score>=35 and s.opp>=80 then 'hot'
+      when s.opp>=70 then 'high'
+      when s.trigger_score>=20 then 'signal'
+      else 'standard'
+    end,
+    updated_at=now()
+from scored s
+where l.id=s.id;
