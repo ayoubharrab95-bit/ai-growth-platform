@@ -11,7 +11,7 @@ function mailboxKind(email:string){
  if(!lp)return "missing";
  if(lp.length<2||["first","firstname","test","example"].includes(lp))return "weak";
  if(/(employment|careers?|jobs?|support|concierge|reservations?|dining|spa|events?|groups?|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)/.test(lp)||/^(hr)$/.test(lp))return "weak";
- if(/^(info|office|admin|hello|contact|sales|marketing|service|team|inquiries|inquiry)$/.test(lp))return "generic";
+ if(/^(info|office|admin|hello|contact|sales|marketing|service|team|inquiries|inquiry|reception|frontdesk|estimates?|estimating|quotes?|build|projects?)$/.test(lp))return "generic";
  return "direct";
 }
 function decisionRoleScore(role:string){
