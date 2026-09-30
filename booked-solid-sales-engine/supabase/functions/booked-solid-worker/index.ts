@@ -242,6 +242,25 @@ function inferSiteTrade(text:string){
  if(/general contractor|commercial contractor|construction company|design[- ]build|construction services/.test(t))return "General Contractor";
  return null;
 }
+function explicitTradeFromIdentity(name:string,domain:string,currentTrade?:string|null){
+ const x=(String(name||"")+" "+String(domain||"")).toLowerCase();
+ const m:string[]=[];
+ if(x.includes("roof"))m.push("Roofing");
+ if(x.includes("plumb"))m.push("Plumbing");
+ if(x.includes("electric"))m.push("Electrical");
+ if(x.includes("hvac")||x.includes("heating")||x.includes("cooling")||x.includes("air conditioning"))m.push("HVAC");
+ if(x.includes("paint"))m.push("Painting");
+ if(x.includes("fence"))m.push("Fence");
+ if(x.includes("cabinet"))m.push("Cabinet");
+ if(x.includes("concrete"))m.push("Concrete");
+ if(x.includes("landscap")||x.includes("lawn care"))m.push("Landscaping");
+ if(x.includes("siding"))m.push("Siding");
+ if(x.includes("window"))m.push("Windows");
+ if(x.includes("remodel")||x.includes("renovat"))m.push("Remodeling");
+ const u=[...new Set(m)];
+ if(currentTrade&&u.includes(String(currentTrade)))return String(currentTrade);
+ return u.length===1?u[0]:null;
+}
 async function searchPermitSource(slug:string,trade:string,location:string,lat?:number,lon?:number){
  let permits:any[]=[];
  if(slug==="chicago_building_permits"){
@@ -491,16 +510,17 @@ async function resolveCompany(job:any){
  let hit:any=null;
  if(directWebsite){hit={url:directWebsite,title:c.name};}
  else{
-  const osm=await searchOSM(job.payload.trade||c.trade||"Mixed",job.payload.geography||"US",lat,lon);
-  hit=osm.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));
-  if(!hit&&String(job.payload.location_text||c.metadata?.source_market||"")){
+  let overpassError:string|null=null;
+  try{const osm=await searchOSM(job.payload.trade||c.trade||"Mixed",job.payload.geography||"US",lat,lon);hit=osm.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));}catch(e){overpassError=e instanceof Error?e.message:String(e)}
+  if(!hit&&String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||"")){
    const geo=await resolveLocationWithNominatim(String(c.name||""),String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||""));
    if(geo?.website)hit={url:geo.website,title:c.name};
-   else if(geo){
+   else if(geo && !overpassError){
     const osm2=await searchOSM(job.payload.trade||c.trade||"Mixed",String(job.payload.location_text||job.payload.geography||"US"),geo.lat,geo.lon);
     hit=osm2.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));
    }
   }
+  if(!hit&&overpassError)throw new Error("overpass_fallback_failed:"+overpassError);
  }
  if(!hit)return {resolved:false,reason:"no_osm_or_nominatim_match"};
  const domain=domainOf(hit.url);if(!domain)return {resolved:false,reason:"no_domain"};
@@ -568,8 +588,8 @@ async function research(job:any){
  }
  for(const x of supplemental){const u=String(x.url??"");const txt=String(x.title??"")+" "+String(x.content??"");for(const e of txt.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[]){const em=e.toLowerCase();const ed=em.split("@")[1];if(ed===domain||ed.endsWith("."+domain))emails.add(em);}await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:"supplemental_search",claim:String(x.title??"Supplemental search result"),snippet:String(x.content??"").slice(0,1200),source_url:u||null,confidence:45,metadata:{provider:"tavily",query_type:"gap_fill"}});}
  if(pages===0&&!supplemental.length){await db.schema("booked_solid").from("companies").update({status:"rejected"}).eq("id",c.id);return {pages,signals:[],emails:0,rejected:"no_reachable_pages"};}
- const supplementalText=supplemental.map(x=>x.content??"").join(" ");const allText=combined+" "+supplementalText;if(!c.trade){const inferred=inferSiteTrade(allText);if(inferred){await db.schema("booked_solid").from("companies").update({trade:inferred,updated_at:new Date().toISOString(),metadata:{...(c.metadata??{}),trade_inferred_from_site:true}}).eq("id",c.id);c.trade=inferred;}}const types=signalTypes(allText);const triggers=detectPainTriggers(allText);const associationMatch=await verifyAssociation(c);if(associationMatch)types.push("association_membership");
- for(const t of types.filter((x:string)=>x!=="association_membership"))await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:t,claim:"Public sources contain signals related to "+t,snippet:allText.slice(0,1200),source_url:root.toString(),confidence:70,metadata:{pages_researched:pages,supplemental_results:supplemental.length}});for(const tr of triggers){const {data:et}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",c.id).eq("evidence_type",tr.type).eq("source_url",root.toString()).limit(1);if((et??[]).length)await db.schema("booked_solid").from("evidence").update({claim:tr.claim,snippet:allText.slice(0,1200),confidence:80,observed_at:new Date().toISOString(),metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}}).eq("id",et![0].id);else await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:tr.type,claim:tr.claim,snippet:allText.slice(0,1200),source_url:root.toString(),confidence:80,metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}});}
+ const supplementalText=supplemental.map(x=>x.content??"").join(" ");const allText=combined+" "+supplementalText;const identityTrade=explicitTradeFromIdentity(c.name,c.canonical_domain,c.trade);if(identityTrade&&c.trade!==identityTrade){await db.schema("booked_solid").from("companies").update({trade:identityTrade,updated_at:new Date().toISOString(),metadata:{...(c.metadata??{}),trade_corrected_from_identity:true,previous_trade:c.trade??null}}).eq("id",c.id);c.trade=identityTrade;}else if(!c.trade){const inferred=inferSiteTrade(allText);if(inferred){await db.schema("booked_solid").from("companies").update({trade:inferred,updated_at:new Date().toISOString(),metadata:{...(c.metadata??{}),trade_inferred_from_site:true}}).eq("id",c.id);c.trade=inferred;}}const types=signalTypes(allText);const triggers=detectPainTriggers(allText);const associationMatch=await verifyAssociation(c);if(associationMatch)types.push("association_membership");
+ for(const t of types.filter((x:string)=>x!=="association_membership")){const claim="Public sources contain signals related to "+t;const {data:oldEv}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",c.id).eq("evidence_type",t).eq("source_url",root.toString()).eq("claim",claim).limit(1);if((oldEv??[]).length)await db.schema("booked_solid").from("evidence").update({snippet:allText.slice(0,1200),confidence:70,observed_at:new Date().toISOString(),metadata:{pages_researched:pages,supplemental_results:supplemental.length}}).eq("id",oldEv![0].id);else await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:t,claim,snippet:allText.slice(0,1200),source_url:root.toString(),confidence:70,metadata:{pages_researched:pages,supplemental_results:supplemental.length}});}for(const tr of triggers){const {data:et}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",c.id).eq("evidence_type",tr.type).eq("source_url",root.toString()).limit(1);if((et??[]).length)await db.schema("booked_solid").from("evidence").update({claim:tr.claim,snippet:allText.slice(0,1200),confidence:80,observed_at:new Date().toISOString(),metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}}).eq("id",et![0].id);else await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:tr.type,claim:tr.claim,snippet:allText.slice(0,1200),source_url:root.toString(),confidence:80,metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}});}
  for(const email of emails){const {data:existingContact}=await db.schema("booked_solid").from("contacts").select("id").eq("company_id",c.id).eq("email",email).maybeSingle();if(existingContact)await db.schema("booked_solid").from("contacts").update({email_confidence:75,source_url:root.toString(),status:"unverified"}).eq("id",existingContact.id);else await db.schema("booked_solid").from("contacts").insert({company_id:c.id,email,email_confidence:75,source_url:root.toString(),status:"unverified"});}for(const ph of phones.values()){const {data:ep}=await db.schema("booked_solid").from("contacts").select("id,phone_confidence").eq("company_id",c.id).eq("phone",ph.phone).limit(1);if((ep??[]).length)await db.schema("booked_solid").from("contacts").update({phone_type:ph.phone_type,phone_confidence:Math.max(Number(ep![0].phone_confidence||0),Number(ph.phone_confidence||0)),phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",ep![0].id);else await db.schema("booked_solid").from("contacts").insert({company_id:c.id,phone:ph.phone,phone_type:ph.phone_type,phone_confidence:ph.phone_confidence,phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),status:"unverified"});}
  await db.schema("booked_solid").from("companies").update({last_researched_at:new Date().toISOString(),last_enriched_at:new Date().toISOString(),enrichment_version:1,status:c.metadata?.hard_excluded_vendor?"rejected":c.status==="qualified"?"qualified":"discovered",metadata:{...(c.metadata??{}),research_pages:pages,supplemental_searches:supplemental.length,phones_found:phones.size,trigger_types:triggers.map((x:any)=>x.type)}}).eq("id",c.id);
  await db.schema("booked_solid").from("work_queue").insert({kind:"qualify",priority:Number(job.priority)+5,payload:{company_id:c.id,strategy_id:job.payload.strategy_id},status:"pending"});
@@ -692,9 +712,9 @@ async function qualify(job:any){
  ]);
  if(ce)throw ce;if(ee)throw ee;if(te)throw te;if(lee)throw lee;if(se)throw se;
  const rows=ev??[];const types=new Set(rows.map((x:any)=>x.evidence_type));const triggerSummary=computeTriggerSummary(rows);const triggerScore=triggerSummary.score;
- const domain=String(c.canonical_domain||"").toLowerCase();const name=String(c.name||"");
- const badDomain=Boolean(c.metadata?.hard_excluded_source)||/reddit\.com|youtube\.com|quora\.com|facebook\.com|instagram\.com|tiktok\.com|linkedin\.com|usatoday\.com|forbes\.com|yelp\.com|angi\.com|homeadvisor\.com|thumbtack\.com|porch\.com|houzz\.com|indeed\.com|ziprecruiter\.com|glassdoor\.com|monster\.com|careerbuilder\.com|simplyhired\.com|zippia\.com|talent\.com|jooble\.org|builtin\.com|bebee\.com|vaia\.com|theladders\.com|icims\.com|jobleads\.com|lever\.co|greenhouse\.io|greenhouse\.com|workable\.com|smartrecruiters\.com|ashbyhq\.com|bamboohr\.com|myquoteiq\.com|buildium\.com|funnelleasing\.com|secondnature\.com|sharefile\.com/i.test(domain);
- const badTitle=/\b(directory|directories|database|guide|best \d+|\d+ best|how to|what is|what are|do .* offer|news|magazine|article|review|reviews|jobs? in|project manager jobs|estimator jobs|recruiter|recruiting|staffing|talent acquisition|top \d+ crms?|\d+\s+ways\b|ways .* automation|ways to use automation|tasks to save time|client portals? for contractors)\b/i.test(name);const leadgenTitle=/^(get|request|compare|find)\b.*\b(estimate|estimates|quote|quotes)\b/i.test(name);
+ const domain=String(c.canonical_domain||"").toLowerCase();const name=String(c.name||"");const identityTrade=explicitTradeFromIdentity(name,domain,c.trade);if(identityTrade&&c.trade!==identityTrade){await db.schema("booked_solid").from("companies").update({trade:identityTrade,updated_at:new Date().toISOString(),metadata:{...(c.metadata??{}),trade_corrected_from_identity:true,previous_trade:c.trade??null}}).eq("id",id);c.trade=identityTrade;}
+ const badDomain=Boolean(c.metadata?.hard_excluded_source)||/reddit\.com|youtube\.com|quora\.com|facebook\.com|instagram\.com|tiktok\.com|linkedin\.com|usatoday\.com|forbes\.com|yelp\.com|angi\.com|homeadvisor\.com|thumbtack\.com|porch\.com|houzz\.com|indeed\.com|ziprecruiter\.com|glassdoor\.com|monster\.com|careerbuilder\.com|simplyhired\.com|zippia\.com|talent\.com|jooble\.org|builtin\.com|bebee\.com|vaia\.com|theladders\.com|icims\.com|jobleads\.com|lever\.co|greenhouse\.io|greenhouse\.com|workable\.com|smartrecruiters\.com|ashbyhq\.com|bamboohr\.com|jobvite\.com|trsstaffing\.com|applyboost\.ai|myquoteiq\.com|buildium\.com|funnelleasing\.com|secondnature\.com|sharefile\.com/i.test(domain);
+ const badTitle=/\b(directory|directories|database|guide|best \d+|\d+ best|how to|what is|what are|do .* offer|news|magazine|article|review|reviews|jobs? in|project manager jobs|estimator jobs|recruiter|recruiting|staffing|talent acquisition|top \d+ crms?|\d+\s+ways\b|ways .* automation|ways to use automation|tasks to save time|client portals? for contractors|roofers? near me|contractors? near me)\b/i.test(name)||/^associated general contractors of\b/i.test(name);const leadgenTitle=/^(get|request|compare|find)\b.*\b(estimate|estimates|quote|quotes)\b/i.test(name);
  const text=(name+" "+String(c.normalized_name||"")+" "+rows.map((x:any)=>String(x.claim||"")+" "+String(x.snippet||"")).join(" ")).toLowerCase();
  const vendorTerms=["software company","software platform","saas","software provider","technology platform","proptech","property management software","estimation software","estimating software","crm software","workflow software","ai platform","marketplace","software solution","technology company","recruiting company","staffing company","recruitment agency","talent agency","executive search"];
  const operatorTerms=["property management company","property manager","property management services","rental management","vacation rental management","apartment management","real estate management services"];
@@ -704,13 +724,13 @@ async function qualify(job:any){
   await db.schema("booked_solid").from("leads").update({status:"suppressed",why_now:isVendor?"Excluded: technology/software vendor rather than an end-customer operating business.":hospitalityNonBuyer?"Excluded: hospitality property rather than a property-management operator.":"Excluded: non-prospect source.",updated_at:new Date().toISOString()}).eq("company_id",id).neq("status","won");
   await updateStrategyLearning(job.payload.strategy_id,8,false);return {score:0,status:"rejected",reason:isVendor?"software_vendor":hospitalityNonBuyer?"hospitality_nonbuyer":leadgenTitle?"leadgen_page":unclassifiedPermitProfessional?"professional_service_nonbuyer":"non_prospect_source"};
  }
- const contractorTrades=["HVAC","Roofing","Plumbing","Electrical","Remodeling","Painting","General Contractor","Commercial Contractor","Cabinet","Flooring","Concrete","Landscaping","Windows","Siding","Deck Builder","Home Builder","Construction"];
+ const contractorTrades=["HVAC","Roofing","Plumbing","Electrical","Remodeling","Painting","Fence","General Contractor","Commercial Contractor","Cabinet","Flooring","Concrete","Landscaping","Windows","Siding","Deck Builder","Home Builder","Construction"];
  const fit=contractorTrades.includes(c.trade)?25:c.trade==="Property Operations"?22:15;
  const painTypes=["estimation_pain","field_quoting","change_orders","workflow_complexity"];
  const pain=Math.min(32,Array.from(types).filter((t:any)=>painTypes.includes(t)).length*10);
  const intentBonus=(types.has("buyer_signal")?10:0)+(types.has("scale_signal")?6:0)+(types.has("recurring_contracts")?6:0)+(c.trade==="Property Operations"&&types.has("property_operations")?6:0)+(types.has("association_membership")?8:0);
- const realEvidence=rows.filter((x:any)=>x.evidence_type!=="search_result");
- const evidenceScore=Math.min(18,realEvidence.length*3);
+ const realEvidence=rows.filter((x:any)=>x.evidence_type!=="search_result");const realEvidenceTypes=new Set(realEvidence.map((x:any)=>String(x.evidence_type||"")));
+ const evidenceScore=Math.min(18,realEvidenceTypes.size*3);
  const validContact=(ct??[]).find((x:any)=>x.email&&x.status!=="invalid"&&x.status!=="suppressed"&&mailboxKind(x.email)!=="weak");
  const contactScore=Math.min(20,Number(validContact?.email_confidence??0)/5);
  const score=Math.min(100,fit+pain+intentBonus+evidenceScore+contactScore);const opportunityScore=Math.round(Math.min(100,score*0.82+triggerScore*0.18));const priorityBand=triggerScore>=35&&opportunityScore>=80?"hot":opportunityScore>=70?"high":triggerScore>=20?"signal":"standard";
@@ -718,7 +738,7 @@ async function qualify(job:any){
  const hasPain=types.has("estimation_pain")||types.has("field_quoting")||types.has("change_orders");
  const prospectType=hasPain?"pain_led":"fit_led";
  const priorQualified=(existingLeads??[]).find((x:any)=>x.status==="qualified");
- let status=priorQualified?"qualified":score>=65&&realEvidence.length>=1?"qualified":score>=40?"candidate":"rejected";
+ let status=priorQualified?"qualified":score>=65&&realEvidenceTypes.size>=1?"qualified":score>=40?"candidate":"rejected";
  const why=triggerSummary.strongest?.claim||(prospectType==="pain_led"?"Public evidence shows a relevant operational/estimating signal.":"Company appears to fit Booked Solid's target customer profile; no pain is assumed.");
  if(status==="rejected"){
   await db.schema("booked_solid").from("companies").update({status:"rejected",recommended_offer:null,updated_at:new Date().toISOString()}).eq("id",id);
