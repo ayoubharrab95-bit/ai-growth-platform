@@ -6,6 +6,59 @@ const out=(x:unknown,s=200)=>new Response(JSON.stringify(x),{status:s,headers:H}
 function domainOf(raw:string){try{return new URL(raw).hostname.replace(/^www\./,"").toLowerCase()}catch{return null}}
 function normalize(s:string){return s.toLowerCase().replace(/[^a-z0-9]+/g," ").trim()}
 function clean(html:string){return html.replace(/<script[\s\S]*?<\/script>/gi," ").replace(/<style[\s\S]*?<\/style>/gi," ").replace(/<[^>]+>/g," ").replace(/&nbsp;/gi," ").replace(/&amp;/gi,"&").replace(/\s+/g," ").trim().slice(0,30000)}
+function mailboxKind(email:string){
+ const lp=String(email||"").toLowerCase().split("@")[0];
+ if(!lp)return "missing";
+ if(lp.length<2||["first","firstname","test","example"].includes(lp))return "weak";
+ if(/^(employment|careers|career|jobs|job|support|concierge|reservations|reservation|dining|spa|events|event|groups|group|hr|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)$/.test(lp))return "weak";
+ if(/^(info|office|admin|hello|contact|sales|marketing|service|team|inquiries|inquiry)$/.test(lp))return "generic";
+ return "direct";
+}
+function decisionRoleScore(role:string){
+ const r=String(role||"").toLowerCase();
+ if(/\b(owner|founder|chief executive|ceo|managing partner|principal)\b/.test(r))return 45;
+ if(/\bpresident\b/.test(r)&&!/\bvice president\b/.test(r))return 45;
+ if(/\b(vice president|vp|director|head of|operations|general manager|gm)\b/.test(r))return 35;
+ if(/\b(estimat|preconstruction|project executive|project manager|office manager)\b/.test(r))return 28;
+ if(/\bmanager\b/.test(r))return 18;
+ return 0;
+}
+function contactResolutionScore(c:any){
+ const kind=mailboxKind(c?.email||"");const role=decisionRoleScore(c?.role||"");
+ let score=role+(c?.full_name?10:0)+Math.min(10,Number(c?.email_confidence||0)/10);
+ if(kind==="direct")score+=30;else if(kind==="generic")score+=15;else if(kind==="weak")score-=35;
+ return Math.max(0,Math.min(100,Math.round(score)));
+}
+function nameParts(name:string){return normalize(String(name||"")).split(" ").filter(Boolean)}
+function emailMatchesName(email:string,name:string){
+ const lp=String(email||"").toLowerCase().split("@")[0].replace(/[^a-z0-9._-]/g,"");
+ const p=nameParts(name);if(p.length<2||!lp)return false;
+ const first=p[0],last=p[p.length-1],fi=first[0]||"";
+ const compact=lp.replace(/[._-]/g,"");
+ return lp===first||lp===last||lp===first+"."+last||lp===first+"_"+last||lp===first+"-"+last||
+        compact===first+last||compact===fi+last||compact===first+last[0];
+}
+async function findPublicNamedEmail(company:any,person:any,contacts:any[]){
+ if(!company?.website_url||!person?.full_name)return null;
+ const domain=String(company.canonical_domain||domainOf(company.website_url)||"").toLowerCase();if(!domain)return null;
+ const known=(contacts||[]).filter((x:any)=>x.email&&mailboxKind(x.email)==="direct"&&emailMatchesName(x.email,person.full_name));
+ if(known.length)return String(known.sort((a:any,b:any)=>Number(b.email_confidence||0)-Number(a.email_confidence||0))[0].email).toLowerCase();
+ let root:URL;try{root=new URL(company.website_url)}catch{return null}
+ const paths=["/","/about","/team","/our-team","/leadership","/contact"];
+ const pages=await Promise.all(paths.map(async p=>{try{
+   const r=await fetch(new URL(p,root),{redirect:"follow",signal:AbortSignal.timeout(5000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});
+   if(!r.ok)return null;const h=await r.text();return {h,visible:clean(h)};
+ }catch{return null}}));
+ for(const pg of pages){
+   if(!pg)continue;
+   const hay=(pg.h+" "+pg.visible);if(!normalize(hay).includes(normalize(person.full_name)))continue;
+   const emails=[...new Set(hay.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[])].map((e:string)=>e.toLowerCase());
+   const match=emails.find((e:string)=>{const ed=e.split("@")[1];return (ed===domain||ed.endsWith("."+domain))&&mailboxKind(e)==="direct"&&emailMatchesName(e,person.full_name)});
+   if(match)return match;
+ }
+ return null;
+}
+
 function signalTypes(text:string){const r:[string,RegExp][]=[["estimation_pain",/(estimate|estimating|proposal|quoting|quote|pricing)/i],["change_orders",/(change order|change-order|scope change|additional work|signed change)/i],["field_quoting",/(on[- ]site quote|field quote|technician quote|instant quote|same[- ]day estimate)/i],["workflow_complexity",/(crm|quickbooks|spreadsheet|multiple locations|project management|dispatch|work order)/i],["buyer_signal",/(hiring|join our team|estimator|preconstruction estimator|project estimator|estimating manager)/i],["scale_signal",/(multiple locations|branches|service areas|portfolio|properties managed|units managed|rooms|regional offices)/i],["recurring_contracts",/(maintenance agreement|service agreement|maintenance contract|service contract)/i],["property_operations",/(property management|vacation rental|guest services|owner services|owner portal|hotel|resort|reservations)/i]];return r.filter(([,x])=>x.test(text)).map(([t])=>t)}
 async function updateStrategyLearning(strategyId:string|undefined,outcome:number,newQualified=false){if(!strategyId)return;try{const {data:s}=await db.schema("booked_solid").from("search_strategies").select("performance_score,qualified_count,uses_count,lifecycle_state,metadata,enabled").eq("id",strategyId).maybeSingle();if(!s)return;const perf=Math.max(1,Math.min(95,Number(s.performance_score??50)*0.85+outcome*0.15));let lifecycle=String(s.lifecycle_state||"active"),enabled=Boolean(s.enabled);const generated=s.metadata?.generated_by==="self_evolution";if(generated&&newQualified){lifecycle="active";enabled=true}else if(generated&&lifecycle==="testing"&&Number(s.uses_count||0)>=5&&perf>=55){lifecycle="active"}else if(generated&&Number(s.uses_count||0)>=10&&perf<25){lifecycle="paused";enabled=false}else if(generated&&Number(s.uses_count||0)>=8&&perf<35){lifecycle="degraded"}await db.schema("booked_solid").from("search_strategies").update({performance_score:perf,qualified_count:Number(s.qualified_count??0)+(newQualified?1:0),lifecycle_state:lifecycle,enabled,updated_at:new Date().toISOString()}).eq("id",strategyId);}catch{}}
 const ALLOW_PAID_SEARCH=false;
@@ -461,6 +514,92 @@ async function research(job:any){
  await db.schema("booked_solid").from("work_queue").insert({kind:"qualify",priority:Number(job.priority)+5,payload:{company_id:c.id,strategy_id:job.payload.strategy_id},status:"pending"});
  return {pages,signals:types,emails:emails.size,supplemental_results:supplemental.length,gap_fill_used:missingName||missingContact||combined.length<500};
 }
+
+async function contactResolve(job:any){
+ const leadId=job.payload?.lead_id;if(!leadId)throw new Error("contact_resolve_lead_id_required");
+ const {data:lead,error:le}=await db.schema("booked_solid").from("leads").select("*,companies(*)").eq("id",leadId).single();if(le)throw le;
+ if(lead.status!=="qualified")return {state:"skipped",reason:"lead_not_qualified",lead_id:leadId,status:lead.status};
+ const company=lead.companies;
+ const {data:raw,error:ce}=await db.schema("booked_solid").from("contacts").select("*").eq("company_id",company.id).neq("status","suppressed");if(ce)throw ce;
+ let contacts=(raw??[]).filter((x:any)=>x.status!=="invalid");
+ const named=[...contacts].filter((x:any)=>x.full_name).sort((a:any,b:any)=>(decisionRoleScore(b.role)-decisionRoleScore(a.role))||(contactResolutionScore(b)-contactResolutionScore(a)));
+ const decisionMakers=named.filter((x:any)=>decisionRoleScore(x.role)>0);
+ let decision=decisionMakers[0]??null;
+
+ // First prefer any decision maker whose name can be linked to a DIRECT email
+ // that is actually present in project data. This outranks a higher title with a generic inbox.
+ for(const person of decisionMakers){
+   const ownDirect=person.email&&mailboxKind(person.email)==="direct"?String(person.email).toLowerCase():null;
+   const knownDirect=ownDirect??contacts.find((x:any)=>x.email&&mailboxKind(x.email)==="direct"&&emailMatchesName(x.email,person.full_name))?.email?.toLowerCase();
+   if(knownDirect){
+     const emailRow=contacts.find((x:any)=>String(x.email||"").toLowerCase()===knownDirect);
+     if(emailRow && (!emailRow.full_name||!emailRow.role)){
+       await db.schema("booked_solid").from("contacts").update({full_name:emailRow.full_name||person.full_name,role:emailRow.role||person.role,email_confidence:Math.max(80,Number(emailRow.email_confidence||0)),updated_at:new Date().toISOString()}).eq("id",emailRow.id);
+       emailRow.full_name=emailRow.full_name||person.full_name;emailRow.role=emailRow.role||person.role;emailRow.email_confidence=Math.max(80,Number(emailRow.email_confidence||0));
+     }
+   }
+ }
+
+ // If no project email matched, try the public company pages for the top two decision makers.
+ let hasLinkedDecision=contacts.some((x:any)=>x.email&&x.full_name&&decisionRoleScore(x.role)>0&&mailboxKind(x.email)==="direct");
+ if(!hasLinkedDecision){
+   for(const person of decisionMakers.slice(0,2)){
+     const found=await findPublicNamedEmail(company,person,contacts);
+     if(!found)continue;
+     const existingEmail=contacts.find((x:any)=>String(x.email||"").toLowerCase()===found);
+     if(existingEmail){
+       if(!existingEmail.full_name||!existingEmail.role){
+         await db.schema("booked_solid").from("contacts").update({full_name:existingEmail.full_name||person.full_name,role:existingEmail.role||person.role,email_confidence:Math.max(80,Number(existingEmail.email_confidence||0)),updated_at:new Date().toISOString()}).eq("id",existingEmail.id);
+         existingEmail.full_name=existingEmail.full_name||person.full_name;existingEmail.role=existingEmail.role||person.role;existingEmail.email_confidence=Math.max(80,Number(existingEmail.email_confidence||0));
+       }
+     }else{
+       const {data:created,error:ie}=await db.schema("booked_solid").from("contacts").insert({company_id:company.id,full_name:person.full_name,role:person.role,email:found,email_confidence:85,source_url:company.website_url,status:"unverified"}).select("*").single();
+       if(!ie&&created)contacts.push(created);
+     }
+     hasLinkedDecision=true;break;
+   }
+ }
+
+ const usable=contacts.filter((x:any)=>x.email&&mailboxKind(x.email)!=="weak");
+ const directNamed=usable.filter((x:any)=>x.full_name&&decisionRoleScore(x.role)>0&&mailboxKind(x.email)==="direct").sort((a:any,b:any)=>(contactResolutionScore(b)-contactResolutionScore(a))||(decisionRoleScore(b.role)-decisionRoleScore(a.role)))[0];
+ const directAny=usable.filter((x:any)=>mailboxKind(x.email)==="direct").sort((a:any,b:any)=>contactResolutionScore(b)-contactResolutionScore(a))[0];
+ const generic=usable.filter((x:any)=>mailboxKind(x.email)==="generic").sort((a:any,b:any)=>Number(b.email_confidence||0)-Number(a.email_confidence||0))[0];
+
+ let chosen:any=null;let contactClass="contact_required";let score=0;let namedContact:any=null;
+ if(directNamed){chosen=directNamed;namedContact=directNamed;decision=directNamed;contactClass="decision_maker_direct";score=Math.max(90,contactResolutionScore(directNamed));}
+ else if(decision&&generic){chosen=generic;namedContact=decision;contactClass="decision_maker_generic_fallback";score=Math.max(72,Math.min(85,decisionRoleScore(decision.role)+30));}
+ else if(directAny){chosen=directAny;namedContact=directAny.full_name?directAny:null;contactClass=directAny.full_name?"named_direct":"direct_email";score=Math.max(62,contactResolutionScore(directAny));}
+ else if(generic){chosen=generic;namedContact=null;contactClass="generic_only";score=55;}
+
+ const weakOnly=!chosen&&contacts.some((x:any)=>x.email&&mailboxKind(x.email)==="weak");
+ const state=chosen?"ready":weakOnly?"weak_only":"contact_required";
+ const retryCount=Number(job.payload?.contact_retry??0);
+ const nextRetryAt=!chosen&&retryCount<3?new Date(Date.now()+72*3600000).toISOString():null;
+ const resolution={
+   state,contact_class:contactClass,score,retry_count:retryCount,next_retry_at:nextRetryAt,
+   recipient_email:chosen?.email?String(chosen.email).toLowerCase():null,
+   recipient_name:namedContact?.full_name||null,
+   recipient_role:namedContact?.role||null,
+   contact_id:namedContact?.id||chosen?.id||null,
+   email_contact_id:chosen?.id||null,
+   email_kind:chosen?.email?mailboxKind(chosen.email):null,
+   decision_maker_known:Boolean(decision),
+   decision_maker_name:decision?.full_name||null,
+   decision_maker_role:decision?.role||null,
+   resolved_at:new Date().toISOString(),
+   candidate_summary:contacts.map((x:any)=>({id:x.id,name:x.full_name||null,role:x.role||null,email:x.email||null,email_kind:x.email?mailboxKind(x.email):"missing",score:contactResolutionScore(x)})).sort((a:any,b:any)=>b.score-a.score).slice(0,8)
+ };
+ await db.schema("booked_solid").from("leads").update({contact_id:resolution.contact_id,contact_score:score,lead_brief:{...(lead.lead_brief||{}),contact_resolution:resolution},updated_at:new Date().toISOString()}).eq("id",lead.id);
+
+ if(!chosen){
+   await db.schema("booked_solid").from("outreach_queue").update({status:"cancelled",failure_reason:weakOnly?"Contact resolution: only weak-function inboxes available.":"Contact resolution: no usable email found."}).eq("lead_id",lead.id).in("status",["blocked_email_not_configured","ready"]);
+   if(nextRetryAt)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:Math.max(30,Number(lead.score||0)-15),payload:{lead_id:lead.id,company_id:company.id,contact_retry:retryCount+1,reason:"scheduled_contact_retry"},status:"pending",available_at:nextRetryAt});
+   return {lead_id:lead.id,company:company.name,...resolution,queued_message:false,retry_scheduled:Boolean(nextRetryAt)};
+ }
+ const {data:mq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","message").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
+ if(!(mq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"message",priority:Number(lead.score||0)+score/10,payload:{lead_id:lead.id},status:"pending"});
+ return {lead_id:lead.id,company:company.name,...resolution,queued_message:true};
+}
 async function qualify(job:any){
  const id=job.payload.company_id;
  const [{data:c,error:ce},{data:ev,error:ee},{data:ct,error:te},{data:existingLeads,error:lee},{data:settings,error:se}]=await Promise.all([
@@ -474,15 +613,15 @@ async function qualify(job:any){
  const rows=ev??[];const types=new Set(rows.map((x:any)=>x.evidence_type));
  const domain=String(c.canonical_domain||"").toLowerCase();const name=String(c.name||"");
  const badDomain=Boolean(c.metadata?.hard_excluded_source)||/reddit\.com|youtube\.com|quora\.com|facebook\.com|instagram\.com|tiktok\.com|linkedin\.com|usatoday\.com|forbes\.com|yelp\.com|angi\.com|homeadvisor\.com|thumbtack\.com|porch\.com|houzz\.com|indeed\.com|ziprecruiter\.com|glassdoor\.com|monster\.com|careerbuilder\.com|simplyhired\.com|zippia\.com|talent\.com|jooble\.org|builtin\.com|bebee\.com|vaia\.com|theladders\.com|icims\.com|jobleads\.com|lever\.co|greenhouse\.io|greenhouse\.com|workable\.com|smartrecruiters\.com|ashbyhq\.com|bamboohr\.com|myquoteiq\.com|buildium\.com|funnelleasing\.com|secondnature\.com|sharefile\.com/i.test(domain);
- const badTitle=/\b(directory|directories|database|guide|best \d+|\d+ best|how to|what is|what are|do .* offer|news|magazine|article|review|reviews|jobs? in|project manager jobs|estimator jobs|recruiter|recruiting|staffing|talent acquisition|top \d+ crms?|\d+\s+ways\b|ways .* automation|ways to use automation|tasks to save time|client portals? for contractors)\b/i.test(name);
+ const badTitle=/\b(directory|directories|database|guide|best \d+|\d+ best|how to|what is|what are|do .* offer|news|magazine|article|review|reviews|jobs? in|project manager jobs|estimator jobs|recruiter|recruiting|staffing|talent acquisition|top \d+ crms?|\d+\s+ways\b|ways .* automation|ways to use automation|tasks to save time|client portals? for contractors)\b/i.test(name);const leadgenTitle=/^(get|request|compare|find)\b.*\b(estimate|estimates|quote|quotes)\b/i.test(name);
  const text=(name+" "+String(c.normalized_name||"")+" "+rows.map((x:any)=>String(x.claim||"")+" "+String(x.snippet||"")).join(" ")).toLowerCase();
  const vendorTerms=["software company","software platform","saas","software provider","technology platform","proptech","property management software","estimation software","estimating software","crm software","workflow software","ai platform","marketplace","software solution","technology company","recruiting company","staffing company","recruitment agency","talent agency","executive search"];
  const operatorTerms=["property management company","property manager","property management services","rental management","vacation rental management","apartment management","real estate management services"];
  const vendorName=/\b(software|saas|platform|workflow automation|technology|proptech)\b/i.test(name);const isVendor=Boolean(c.metadata?.hard_excluded_vendor)||vendorName||(vendorTerms.some(t=>text.includes(t))&&!operatorTerms.some(t=>text.includes(t)));const hospitalityNonBuyer=c.trade==="Property Operations"&&/\b(hotel|resort|motel|inn|suites?)\b/i.test(name+" "+domain);const permitSourced=/permits|permit_contractors|permit_contacts|trade_licenses/i.test(String(c.source_first_seen||""));const unclassifiedPermitProfessional=permitSourced&&!c.trade&&/\b(engineer(?:ing)?|architect(?:ure|ural)?|consulting|design studio|surveying)\b/i.test(text);
- if(badDomain||badTitle||isVendor||unclassifiedPermitProfessional||hospitalityNonBuyer){
+ if(badDomain||badTitle||leadgenTitle||isVendor||unclassifiedPermitProfessional||hospitalityNonBuyer){
   await db.schema("booked_solid").from("companies").update({status:"rejected",recommended_offer:null,updated_at:new Date().toISOString()}).eq("id",id);
   await db.schema("booked_solid").from("leads").update({status:"suppressed",why_now:isVendor?"Excluded: technology/software vendor rather than an end-customer operating business.":hospitalityNonBuyer?"Excluded: hospitality property rather than a property-management operator.":"Excluded: non-prospect source.",updated_at:new Date().toISOString()}).eq("company_id",id).neq("status","won");
-  await updateStrategyLearning(job.payload.strategy_id,8,false);return {score:0,status:"rejected",reason:isVendor?"software_vendor":hospitalityNonBuyer?"hospitality_nonbuyer":unclassifiedPermitProfessional?"professional_service_nonbuyer":"non_prospect_source"};
+  await updateStrategyLearning(job.payload.strategy_id,8,false);return {score:0,status:"rejected",reason:isVendor?"software_vendor":hospitalityNonBuyer?"hospitality_nonbuyer":leadgenTitle?"leadgen_page":unclassifiedPermitProfessional?"professional_service_nonbuyer":"non_prospect_source"};
  }
  const contractorTrades=["HVAC","Roofing","Plumbing","Electrical","Remodeling","Painting","General Contractor","Commercial Contractor","Cabinet","Flooring","Concrete","Landscaping","Windows","Siding","Deck Builder","Home Builder","Construction"];
  const fit=contractorTrades.includes(c.trade)?25:c.trade==="Property Operations"?22:15;
@@ -491,7 +630,7 @@ async function qualify(job:any){
  const intentBonus=(types.has("buyer_signal")?10:0)+(types.has("scale_signal")?6:0)+(types.has("recurring_contracts")?6:0)+(c.trade==="Property Operations"&&types.has("property_operations")?6:0)+(types.has("association_membership")?8:0);
  const realEvidence=rows.filter((x:any)=>x.evidence_type!=="search_result");
  const evidenceScore=Math.min(18,realEvidence.length*3);
- const validContact=(ct??[]).find((x:any)=>x.email&&x.status!=="invalid"&&x.status!=="suppressed");
+ const validContact=(ct??[]).find((x:any)=>x.email&&x.status!=="invalid"&&x.status!=="suppressed"&&mailboxKind(x.email)!=="weak");
  const contactScore=Math.min(20,Number(validContact?.email_confidence??0)/5);
  const score=Math.min(100,fit+pain+intentBonus+evidenceScore+contactScore);
  let offer="custom_estimator";if(types.has("change_orders"))offer="penmark";else if(c.trade==="Property Operations")offer="automation";else if(types.has("estimation_pain")||types.has("field_quoting")||types.has("buyer_signal"))offer="custom_estimator";else if(types.has("recurring_contracts")||types.has("scale_signal")||types.has("workflow_complexity"))offer="automation";
@@ -505,14 +644,13 @@ async function qualify(job:any){
   for(const l of (existingLeads??[]).filter((x:any)=>x.status!=="won"))await db.schema("booked_solid").from("leads").update({status:"suppressed",why_now:why,updated_at:new Date().toISOString()}).eq("id",l.id);
   await updateStrategyLearning(job.payload.strategy_id,20,false);return {score,offer,status,prospect_type:prospectType,contact_found:!!validContact};
  }
- const leadPayload={company_id:id,contact_id:validContact?.id??null,strategy_id:job.payload.strategy_id??null,offer,score,fit_score:fit,pain_score:pain,evidence_score:evidenceScore,contact_score:contactScore,status,why_now:why,lead_brief:{prospect_type:prospectType,evidence_types:[...types],company:c.name,website:c.website_url,contact_status:validContact?"unverified":"missing"}};
+ const priorBrief=(priorQualified??(existingLeads??[])[0])?.lead_brief??{};const leadPayload={company_id:id,contact_id:validContact?.id??null,strategy_id:job.payload.strategy_id??null,offer,score,fit_score:fit,pain_score:pain,evidence_score:evidenceScore,contact_score:contactScore,status,why_now:why,lead_brief:{...priorBrief,prospect_type:prospectType,evidence_types:[...types],company:c.name,website:c.website_url,contact_status:validContact?"unverified":"missing"}};
  const existing=priorQualified??(existingLeads??[]).find((x:any)=>x.offer===offer)??(existingLeads??[])[0];let lead:any;
  if(existing){const {data:u,error:ue}=await db.schema("booked_solid").from("leads").update(leadPayload).eq("id",existing.id).select("*").single();if(ue)throw ue;lead=u;}
  else{const {data:i,error:ie}=await db.schema("booked_solid").from("leads").insert(leadPayload).select("*").single();if(ie)throw ie;lead=i;}
  if(status==="qualified"){
-  const {data:oq}=await db.schema("booked_solid").from("outreach_queue").select("id").eq("lead_id",lead.id).eq("sequence_no",1).maybeSingle();
-  const {data:mq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","message").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
-  if(!oq&&!(mq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"message",priority:score,payload:{lead_id:lead.id},status:"pending"});
+  const {data:cq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","contact").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
+  if(!(cq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:score+10,payload:{lead_id:lead.id,company_id:id},status:"pending"});
   await db.schema("booked_solid").from("companies").update({status:"qualified",recommended_offer:offer,fit_score:fit,updated_at:new Date().toISOString()}).eq("id",id);
   await updateStrategyLearning(job.payload.strategy_id,90,!priorQualified);
  }else{
@@ -529,4 +667,4 @@ async function message(job:any){
  if(!r.ok)throw new Error("message_prep_http_"+r.status+":"+String(data?.error||txt).slice(0,500));
  return data;
 }
-Deno.serve(async req=>{try{if(req.method==="OPTIONS")return new Response("ok",{headers:H});await db.schema("booked_solid").from("work_queue").update({status:"pending",locked_at:null,locked_by:null,available_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("status","running").lt("locked_at",new Date(Date.now()-15*60000).toISOString());const {data:jobs,error}=await db.rpc("claim_booked_solid_work",{p_worker:"booked-solid-"+crypto.randomUUID()});if(error)throw error;const job=jobs?.[0];if(!job)return out({ok:true,idle:true});let result:any;try{if(job.kind==="discover")result=await discover(job);else if(job.kind==="research")result=await research(job);else if(job.kind==="qualify")result=await qualify(job);else if(job.kind==="message")result=await message(job);else if(job.kind==="resolve")result=await resolveCompany(job);else result={skipped:job.kind};await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,updated_at:new Date().toISOString()}).eq("id",job.id);return out({ok:true,job_id:job.id,kind:job.kind,result});}catch(e){const msg=e instanceof Error?e.message:(e&&typeof e==="object"?JSON.stringify(e):String(e));const blocked=msg.includes("SEARCH_PROVIDER_NOT_CONFIGURED");const retry=!blocked&&Number(job.attempts??0)<3;if(job.kind==="discover"&&job.payload?.source_slug)await db.schema("booked_solid").rpc("record_source_failure",{p_slug:job.payload.source_slug,p_error:msg});await db.schema("booked_solid").from("work_queue").update({status:blocked?"blocked":retry?"pending":"failed",last_error:msg,available_at:new Date(Date.now()+600000).toISOString(),locked_at:null,locked_by:null,updated_at:new Date().toISOString()}).eq("id",job.id);return out({ok:false,job_id:job.id,kind:job.kind,blocked,retry,error:msg},blocked?424:500);}}catch(e){console.error(e);return out({ok:false,error:String(e)},500)}});
+Deno.serve(async req=>{try{if(req.method==="OPTIONS")return new Response("ok",{headers:H});await db.schema("booked_solid").from("work_queue").update({status:"pending",locked_at:null,locked_by:null,available_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("status","running").lt("locked_at",new Date(Date.now()-15*60000).toISOString());const {data:jobs,error}=await db.rpc("claim_booked_solid_work",{p_worker:"booked-solid-"+crypto.randomUUID()});if(error)throw error;const job=jobs?.[0];if(!job)return out({ok:true,idle:true});let result:any;try{if(job.kind==="discover")result=await discover(job);else if(job.kind==="research")result=await research(job);else if(job.kind==="qualify")result=await qualify(job);else if(job.kind==="contact")result=await contactResolve(job);else if(job.kind==="message")result=await message(job);else if(job.kind==="resolve")result=await resolveCompany(job);else result={skipped:job.kind};await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,updated_at:new Date().toISOString()}).eq("id",job.id);return out({ok:true,job_id:job.id,kind:job.kind,result});}catch(e){const msg=e instanceof Error?e.message:(e&&typeof e==="object"?JSON.stringify(e):String(e));const blocked=msg.includes("SEARCH_PROVIDER_NOT_CONFIGURED");const retry=!blocked&&Number(job.attempts??0)<3;if(job.kind==="discover"&&job.payload?.source_slug)await db.schema("booked_solid").rpc("record_source_failure",{p_slug:job.payload.source_slug,p_error:msg});await db.schema("booked_solid").from("work_queue").update({status:blocked?"blocked":retry?"pending":"failed",last_error:msg,available_at:new Date(Date.now()+600000).toISOString(),locked_at:null,locked_by:null,updated_at:new Date().toISOString()}).eq("id",job.id);return out({ok:false,job_id:job.id,kind:job.kind,blocked,retry,error:msg},blocked?424:500);}}catch(e){console.error(e);return out({ok:false,error:String(e)},500)}});
