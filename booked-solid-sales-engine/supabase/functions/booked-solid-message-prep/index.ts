@@ -15,7 +15,7 @@ function isSuspicious(email:string){
  return !email || ["first","firstname","test","example","noreply","no-reply","donotreply","do-not-reply"].includes(lp) || lp.length<2;
 }
 function isWeak(email:string){const lp=String(email||"").toLowerCase().split("@")[0];return /(employment|careers?|jobs?|support|concierge|reservations?|dining|spa|events?|groups?|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)/.test(lp)||lp==="hr"}
-function isGeneric(email:string){return /^(info|office|admin|hello|contact|sales|marketing|service|team|inquiries|inquiry)@/i.test(email)}
+function isGeneric(email:string){return /^(info|office|admin|hello|contact|sales|marketing|service|team|inquiries|inquiry|reception|frontdesk|estimates?|estimating|quotes?|build|projects?)@/i.test(email)}
 function utm(base:string,company:string,offer:string,seq:number,angle:string,leadId:string){
  const u=new URL(base);
  u.searchParams.set("utm_source","outbound_email");
