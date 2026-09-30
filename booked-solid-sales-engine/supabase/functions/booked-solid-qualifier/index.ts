@@ -42,7 +42,7 @@ Deno.serve(async req=>{
   const evidenceScore=Math.min(20,rows.filter((x:any)=>x.evidence_type!=="search_result").length*4);
   const usableContact=(contacts??[]).find((c:any)=>c.email&&!weakMailbox(c.email)&&c.status!=="invalid"&&c.status!=="suppressed");const contact=usableContact?.email_confidence??0;
   const contactScore=Math.min(20,Number(contact)/5);
-  const score=Math.min(100,fit+pain+evidenceScore+contactScore);const opportunityScore=Math.round(Math.min(100,score*0.82+triggerScore*0.18));const priorityBand=triggerScore>=35&&opportunityScore>=75?"hot":opportunityScore>=70?"high":triggerScore>=20?"signal":"standard";
+  const score=Math.min(100,fit+pain+evidenceScore+contactScore);const opportunityScore=Math.round(Math.min(100,score*0.82+triggerScore*0.18));const priorityBand=triggerScore>=35&&opportunityScore>=80?"hot":opportunityScore>=70?"high":triggerScore>=20?"signal":"standard";
   let offer="custom_estimator";
   if(types.has("change_orders"))offer="penmark";
   else if(types.has("workflow_complexity")&&!types.has("estimation_pain"))offer="automation";
