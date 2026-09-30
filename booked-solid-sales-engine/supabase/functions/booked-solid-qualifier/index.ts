@@ -3,6 +3,13 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 const H={"Content-Type":"application/json","Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"authorization, x-client-info, apikey, content-type"};
 const db=createClient(Deno.env.get("SUPABASE_URL")!,Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const out=(x:unknown,s=200)=>new Response(JSON.stringify(x),{status:s,headers:H});
+function tradeFromIdentity(name:string,domain:string,current?:string|null){
+ const x=(String(name||"")+" "+String(domain||"")).toLowerCase();const m:string[]=[];
+ if(x.includes("roof"))m.push("Roofing");if(x.includes("plumb"))m.push("Plumbing");if(x.includes("electric"))m.push("Electrical");
+ if(x.includes("hvac")||x.includes("heating")||x.includes("cooling")||x.includes("air conditioning"))m.push("HVAC");
+ if(x.includes("paint"))m.push("Painting");if(x.includes("fence"))m.push("Fence");if(x.includes("cabinet"))m.push("Cabinet");
+ const u=[...new Set(m)];if(current&&u.includes(String(current)))return String(current);return u.length===1?u[0]:null;
+}
 function weakMailbox(email:string){const e=String(email||"").toLowerCase();const lp=e.split("@")[0];return !lp||lp.length<2||["first","firstname","test","example"].includes(lp)||/(employment|careers?|jobs?|support|concierge|reservations?|dining|spa|events?|groups?|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)/.test(lp)||lp==="hr"}
 function triggerSummary(rows:any[]){
  const best=new Map<string,any>();
@@ -26,6 +33,7 @@ Deno.serve(async req=>{
   if(ce)throw ce;if(ee)throw ee;if(cte)throw cte;if(lee)throw lee;
   const rows=evidence??[];
   const types=new Set(rows.map((x:any)=>x.evidence_type));const triggers=triggerSummary(rows);const triggerScore=triggers.score;
+  const identityTrade=tradeFromIdentity(company.name,company.canonical_domain,company.trade);if(identityTrade&&identityTrade!==company.trade){await db.schema("booked_solid").from("companies").update({trade:identityTrade,updated_at:new Date().toISOString(),metadata:{...(company.metadata??{}),trade_corrected_from_identity:true,previous_trade:company.trade??null}}).eq("id",id);company.trade=identityTrade;}
   const text=((company.name??"")+" "+(company.normalized_name??"")+" "+rows.map((x:any)=>((x.claim??"")+" "+(x.snippet??""))).join(" ")).toLowerCase();
   const vendorTerms=["software company","software platform","saas","software provider","technology platform","proptech","property management software","estimation software","estimating software","crm software","workflow software","ai platform","api","marketplace","software solution","technology company"];
   const operatorTerms=["property management company","property manager","property management services","rental management","vacation rental management","apartment management","real estate management services"];
