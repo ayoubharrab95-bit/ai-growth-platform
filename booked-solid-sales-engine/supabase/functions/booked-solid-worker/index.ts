@@ -290,15 +290,16 @@ function osmSelectors(trade:string){
 }
 async function searchOSM(trade:string,location:string,latArg?:number,lonArg?:number){
  const sels=osmSelectors(trade);if(!sels.length)return {provider:"openstreetmap_overpass",results:[]};
- let lat=Number(latArg),lon=Number(lonArg);
+ let lat=coordinateOrNaN(latArg),lon=coordinateOrNaN(lonArg);
  if(!Number.isFinite(lat)||!Number.isFinite(lon)){
-  const nu=new URL("https://nominatim.openstreetmap.org/search");nu.searchParams.set("format","jsonv2");nu.searchParams.set("limit","1");nu.searchParams.set("countrycodes","us");nu.searchParams.set("q",location);nu.searchParams.set("email","info@bookedsolidcopy.com");
-  const nr=await fetch(nu,{signal:AbortSignal.timeout(7000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)","Accept":"application/json"}});
-  if(!nr.ok)throw new Error("nominatim_http_"+nr.status);const gj=await nr.json();if(!gj?.[0])return {provider:"openstreetmap_overpass",results:[]};lat=Number(gj[0].lat);lon=Number(gj[0].lon);
+  const geo=await resolveMarketWithNominatim(location);
+  if(geo?.error)throw new Error(geo.error);
+  if(!geo)return {provider:"openstreetmap_overpass",results:[]};
+  lat=Number(geo.lat);lon=Number(geo.lon);
  }
  const parts=sels.map((s:string)=>`nwr(around:40000,${lat},${lon})${s};`).join("");
  const oq=`[out:json][timeout:6];(${parts});out center tags 50;`;
- let or:any=null;let lastStatus=0;for(const base of ["https://overpass.private.coffee/api/interpreter","https://overpass-api.de/api/interpreter","https://maps.mail.ru/osm/tools/overpass/api/interpreter"]){try{const rr=await fetch(base,{method:"POST",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)","Accept":"application/json","Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({data:oq})});lastStatus=rr.status;if(rr.ok){or=rr;break;}}catch{}}if(!or)throw new Error("overpass_http_"+lastStatus);const oj=await or.json();const outRows:any[]=[];
+ let or:any=null;let lastStatus=0;for(const base of ["https://maps.mail.ru/osm/tools/overpass/api/interpreter","https://overpass-api.de/api/interpreter","https://overpass.private.coffee/api/interpreter"]){try{const rr=await fetch(base,{method:"POST",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)","Accept":"application/json","Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({data:oq})});lastStatus=rr.status;if(rr.ok){or=rr;break;}}catch{}}if(!or)throw new Error("overpass_http_"+lastStatus);const oj=await or.json();const outRows:any[]=[];
  for(const el of oj.elements??[]){
   const tags=el.tags??{};const name=String(tags.name??tags.operator??"").trim();let url=String(tags.website??tags["contact:website"]??tags.url??"").trim();if(!name||!url)continue;if(!/^https?:\/\//i.test(url))url="https://"+url.replace(/^\/\//,"");
   const street=[tags["addr:housenumber"],tags["addr:street"]].filter(Boolean).join(" ").trim();
@@ -689,81 +690,133 @@ async function verifyAssociation(c:any){
  }catch{return null;}
 }
 
+function coordinateOrNaN(v:any){
+ if(v===null||v===undefined||v==="")return NaN;
+ const n=Number(v);return Number.isFinite(n)?n:NaN;
+}
+function usefulResolutionLocation(text:string){
+ const n=normalize(String(text||"")).trim();
+ return Boolean(n)&&!["us","usa","united states","united states of america"].includes(n);
+}
+function nominatimCooldownMinutes(status:number){
+ if(status===403||status===429)return 60;
+ if(status>=500)return 20;
+ if(status===0||status===408||status===425)return 15;
+ return 30;
+}
+async function markNominatimCooldown(status:number,detail:string){
+ const mins=nominatimCooldownMinutes(status),until=new Date(Date.now()+mins*60000).toISOString();
+ try{
+  const {data:s}=await db.schema("booked_solid").from("source_catalog").select("metadata").eq("slug","openstreetmap_overpass").maybeSingle();
+  await db.schema("booked_solid").from("source_catalog").update({metadata:{...(s?.metadata??{}),nominatim_cooldown_until:until,nominatim_cooldown_minutes:mins,nominatim_last_status:status,nominatim_last_error:String(detail||"").slice(0,300),nominatim_last_failure_at:new Date().toISOString()},updated_at:new Date().toISOString()}).eq("slug","openstreetmap_overpass");
+ }catch{}
+ return until;
+}
 async function resolveLocationWithNominatim(companyName:string,locationText:string){
- if(!companyName||!locationText)return null;
+ if(!companyName||!usefulResolutionLocation(locationText))return null;
  try{
   const u=new URL("https://nominatim.openstreetmap.org/search");u.searchParams.set("format","jsonv2");u.searchParams.set("limit","3");u.searchParams.set("countrycodes","us");u.searchParams.set("extratags","1");u.searchParams.set("namedetails","1");u.searchParams.set("q",companyName+", "+locationText);
   const r=await fetch(u,{signal:AbortSignal.timeout(6000),headers:{"Accept":"application/json","User-Agent":"BookedSolidResolver/1.0 (+https://www.bookedsolidcopy.com/)"}});
-  if(!r.ok)return null;const rows=await r.json();if(!Array.isArray(rows)||!rows.length)return null;
+  if(!r.ok){const until=await markNominatimCooldown(r.status,"nominatim_http_"+r.status);return {error:"nominatim_http_"+r.status,cooldown_until:until};}
+  const rows=await r.json();if(!Array.isArray(rows)||!rows.length)return null;
   const tokens=normalize(companyName).split(" ").filter((x:string)=>x.length>2);
   const hit=rows.find((x:any)=>{const tx=normalize(String(x.display_name||"")+" "+String(x.namedetails?.name||""));const n=tokens.filter((t:string)=>tx.includes(t)).length;return n>=Math.min(2,tokens.length)||tokens.length===1&&n===1;})??rows[0];
   const web=String(hit?.extratags?.website||hit?.extratags?.["contact:website"]||hit?.extratags?.url||"").trim();
   return {lat:Number(hit.lat),lon:Number(hit.lon),website:web||null,display_name:hit.display_name??null};
- }catch{return null}
+ }catch(e){
+  const msg=e instanceof Error?e.message:String(e),until=await markNominatimCooldown(0,msg);
+  return {error:"nominatim_transient_0",cooldown_until:until};
+ }
 }
+async function resolveMarketWithNominatim(locationText:string){
+ if(!usefulResolutionLocation(locationText))return null;
+ try{
+  const u=new URL("https://nominatim.openstreetmap.org/search");u.searchParams.set("format","jsonv2");u.searchParams.set("limit","1");u.searchParams.set("countrycodes","us");u.searchParams.set("q",locationText);u.searchParams.set("email","info@bookedsolidcopy.com");
+  const r=await fetch(u,{signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)","Accept":"application/json"}});
+  if(!r.ok){const until=await markNominatimCooldown(r.status,"nominatim_http_"+r.status);return {error:"nominatim_http_"+r.status,cooldown_until:until};}
+  const rows=await r.json();if(!Array.isArray(rows)||!rows.length)return null;
+  return {lat:Number(rows[0].lat),lon:Number(rows[0].lon)};
+ }catch(e){
+  const msg=e instanceof Error?e.message:String(e),until=await markNominatimCooldown(0,msg);
+  return {error:"nominatim_transient_0",cooldown_until:until};
+ }
+}
+async function deferResolveJob(job:any,c:any,reason:string,resumeAt:string,extra:any={}){
+ const {data:already}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","resolve").eq("status","pending").contains("payload",{company_id:c.id}).limit(1);
+ if(!(already??[]).length){
+  await db.schema("booked_solid").from("work_queue").insert({kind:"resolve",priority:Number(job.priority||50),payload:{...job.payload,deferred_reason:reason},status:"pending",available_at:resumeAt});
+ }
+ await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"deferred_"+reason,preflight_last_attempt_at:new Date().toISOString()}}).eq("id",c.id);
+ return {resolved:false,reason,retry_scheduled:!(already??[]).length,resume_at:resumeAt,...extra};
+}
+
 async function resolveCompany(job:any){
  const id=job.payload.company_id;const {data:c,error}=await db.schema("booked_solid").from("companies").select("*").eq("id",id).single();if(error)throw error;
  if(c.status==="rejected"&&c.metadata?.duplicate_of)return {resolved:false,reason:"already_marked_duplicate",duplicate_of:c.metadata.duplicate_of};
+ if(c.status==="rejected")return {resolved:false,reason:"skipped_rejected_company"};
  if(c.website_url&&c.canonical_domain){
   const {data:rq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","research").in("status",["pending","running"]).contains("payload",{company_id:id}).limit(1);
   if(!(rq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+3,payload:{company_id:id,strategy_id:job.payload.strategy_id,reason:"preflight_existing_domain"},status:"pending"});
   return {resolved:true,already:true};
  }
 
- let lat=job.payload.latitude,lon=job.payload.longitude;let directWebsite:string|null=null;let cachedGeo:any=null;let resolutionMethod="unknown";let resolutionConfidence=0;let preflight:any=null;
-
- // Fast Preflight v2: verified business-domain email first. This avoids OSM when official/public permit data already exposes a company-domain email.
+ let lat=coordinateOrNaN(job.payload.latitude),lon=coordinateOrNaN(job.payload.longitude);
+ let directWebsite:string|null=null,cachedGeo:any=null,resolutionMethod="unknown",resolutionConfidence=0,preflight:any=null;
  const emailResolved=await verifiedWebsiteFromContactEmail(c);
- if(emailResolved){
-  directWebsite=emailResolved.url;resolutionMethod=emailResolved.method;resolutionConfidence=emailResolved.confidence;preflight=emailResolved;
- }
-
- if(!directWebsite&&(lat==null||lon==null)&&String(job.payload.location_text||c.metadata?.source_market||"")){
-  cachedGeo=await resolveLocationWithNominatim(String(c.name||""),String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||""));
-  if(cachedGeo){lat=cachedGeo.lat;lon=cachedGeo.lon;if(cachedGeo.website){directWebsite=cachedGeo.website;resolutionMethod="nominatim_extratag_website";resolutionConfidence=88;}}
- }
+ if(emailResolved){directWebsite=emailResolved.url;resolutionMethod=emailResolved.method;resolutionConfidence=emailResolved.confidence;preflight=emailResolved;}
 
  const {data:osmHealth}=await db.schema("booked_solid").from("source_catalog").select("enabled,lifecycle_state,metadata").eq("slug","openstreetmap_overpass").maybeSingle();
- const osmCooldownRaw=String(osmHealth?.metadata?.cooldown_until||"");
- const osmCooldownMs=osmCooldownRaw?new Date(osmCooldownRaw).getTime():0;
- const osmCooling=Number.isFinite(osmCooldownMs)&&osmCooldownMs>Date.now();
-
- if(osmCooling&&!directWebsite){
-  const locText=String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||"");
-  if(!cachedGeo&&locText)cachedGeo=await resolveLocationWithNominatim(String(c.name||""),locText);
-  if(cachedGeo?.website){directWebsite=cachedGeo.website;resolutionMethod="nominatim_extratag_website";resolutionConfidence=88;}
-  else{
-   const resumeAt=new Date(Math.max(Date.now()+5*60000,osmCooldownMs+60000)).toISOString();
-   const {data:already}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","resolve").eq("status","pending").contains("payload",{company_id:id}).limit(1);
-   if(!(already??[]).length){
-    await db.schema("booked_solid").from("work_queue").insert({kind:"resolve",priority:Number(job.priority||50),payload:{...job.payload,deferred_reason:"openstreetmap_cooldown"},status:"pending",available_at:resumeAt});
-   }
-   await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"deferred_source_cooldown",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
-   return {resolved:false,reason:"openstreetmap_cooling_deferred",retry_scheduled:!(already??[]).length,resume_at:resumeAt,cooldown_until:osmCooldownRaw};
-  }
- }
+ const osmCooldownRaw=String(osmHealth?.metadata?.cooldown_until||""),geoCooldownRaw=String(osmHealth?.metadata?.nominatim_cooldown_until||"");
+ const osmCooldownMs=osmCooldownRaw?new Date(osmCooldownRaw).getTime():0,geoCooldownMs=geoCooldownRaw?new Date(geoCooldownRaw).getTime():0;
+ const osmCooling=Number.isFinite(osmCooldownMs)&&osmCooldownMs>Date.now(),geoCooling=Number.isFinite(geoCooldownMs)&&geoCooldownMs>Date.now();
+ const locText=String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||"").trim();
 
  let hit:any=null;
- if(directWebsite){hit={url:directWebsite,title:c.name};}
+ if(directWebsite)hit={url:directWebsite,title:c.name};
  else{
-  let overpassError:string|null=null;
-  try{const osm=await searchOSM(job.payload.trade||c.trade||"Mixed",job.payload.geography||"US",lat,lon);hit=osm.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));if(hit){resolutionMethod="openstreetmap_overpass";resolutionConfidence=88;}}catch(e){overpassError=e instanceof Error?e.message:String(e)}
-  if(!hit&&String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||"")){
-   const geo=cachedGeo??await resolveLocationWithNominatim(String(c.name||""),String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||""));
-   if(geo?.website){hit={url:geo.website,title:c.name};resolutionMethod="nominatim_extratag_website";resolutionConfidence=88;}
-   else if(geo&&!overpassError){
-    const osm2=await searchOSM(job.payload.trade||c.trade||"Mixed",String(job.payload.location_text||job.payload.geography||"US"),geo.lat,geo.lon);
-    hit=osm2.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));if(hit){resolutionMethod="openstreetmap_overpass_near_nominatim";resolutionConfidence=86;}
+  if((!Number.isFinite(lat)||!Number.isFinite(lon))&&!usefulResolutionLocation(locText)){
+   await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"insufficient_location",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
+   return {resolved:false,reason:"insufficient_location_for_resolution"};
+  }
+  if(osmCooling){
+   const resumeAt=new Date(Math.max(Date.now()+5*60000,osmCooldownMs+60000)).toISOString();
+   return await deferResolveJob(job,c,"openstreetmap_cooldown",resumeAt,{cooldown_until:osmCooldownRaw});
+  }
+
+  if(!Number.isFinite(lat)||!Number.isFinite(lon)){
+   if(geoCooling){
+    const resumeAt=new Date(Math.max(Date.now()+5*60000,geoCooldownMs+60000)).toISOString();
+    return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{cooldown_until:geoCooldownRaw});
+   }
+   cachedGeo=await resolveLocationWithNominatim(String(c.name||""),locText);
+   if(cachedGeo?.error){
+    const resumeAt=String(cachedGeo.cooldown_until||new Date(Date.now()+30*60000).toISOString());
+    return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{nominatim_error:cachedGeo.error});
+   }
+   if(cachedGeo){
+    lat=Number(cachedGeo.lat);lon=Number(cachedGeo.lon);
+    if(cachedGeo.website){directWebsite=cachedGeo.website;resolutionMethod="nominatim_extratag_website";resolutionConfidence=88;hit={url:directWebsite,title:c.name};}
+   }else{
+    await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"geocoder_no_match",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
+    return {resolved:false,reason:"geocoder_no_match"};
    }
   }
-  if(!hit&&overpassError)throw new Error("overpass_fallback_failed:"+overpassError);
+
+  if(!hit&&Number.isFinite(lat)&&Number.isFinite(lon)){
+   let overpassError:string|null=null;
+   try{
+    const osm=await searchOSM(job.payload.trade||c.trade||"Mixed",job.payload.geography||locText||"US",lat,lon);
+    hit=osm.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));
+    if(hit){resolutionMethod="openstreetmap_overpass";resolutionConfidence=88;}
+   }catch(e){overpassError=e instanceof Error?e.message:String(e);}
+   if(!hit&&overpassError)throw new Error("overpass_fallback_failed:"+overpassError);
+  }
  }
 
  if(!hit){
   await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"unresolved",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
   return {resolved:false,reason:"no_verified_website_match"};
  }
-
  const domain=domainOf(hit.url);if(!domain)return {resolved:false,reason:"no_domain"};
  const {data:dupe}=await db.schema("booked_solid").from("companies").select("*").eq("canonical_domain",domain).neq("id",id).maybeSingle();
  if(dupe){
@@ -772,7 +825,6 @@ async function resolveCompany(job:any){
   if(!(rq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+3,payload:{company_id:dupe.id,strategy_id:job.payload.strategy_id,reason:"identity_merge_v2"},status:"pending"});
   return {resolved:true,merged_into:dupe.id,domain,resolution_method:resolutionMethod,merge:merged};
  }
-
  const preflightScore=Math.min(100,40+(resolutionConfidence>=90?25:18)+(c.state?10:0)+(c.trade?10:0)+(preflight?.email_domain?15:0));
  await db.schema("booked_solid").from("companies").update({
   canonical_domain:domain,website_url:"https://"+domain+"/",
@@ -848,6 +900,7 @@ async function discover(job:any){
 async function locationEnrich(job:any){
  const {data:c,error}=await db.schema("booked_solid").from("companies").select("*").eq("id",job.payload.company_id).single();if(error)throw error;
  const now=new Date().toISOString();
+ if(c.status==="rejected")return {company_id:c.id,state:"skipped_rejected"};
  if(c.location_text&&c.state)return {company_id:c.id,state:"already_complete",location_text:c.location_text,region:c.state};
  if(!c.website_url){await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),location_last_attempt_at:now,location_enrichment_status:"no_website"}}).eq("id",c.id);return {company_id:c.id,state:"no_website"};}
  let root:URL;try{root=new URL(c.website_url)}catch{return {company_id:c.id,state:"invalid_website"}}
@@ -1277,7 +1330,10 @@ async function message(job:any){
 }
 function classifyRuntimeFailure(msg:string){
  const m=String(msg||"").toLowerCase();
- if(/overpass_http_(0|406|408|425|429|5\\d\\d)/.test(m)||/overpass_fallback_failed:overpass_http_(0|406|408|425|429|5\\d\\d)/.test(m))return "overpass_transient";
+ if(/overpass_http_(0|403|406|408|425|429|5\\d\\d)/.test(m)||/overpass_fallback_failed:overpass_http_(0|403|406|408|425|429|5\\d\\d)/.test(m))return "overpass_transient";
+ if(/nominatim_(?:http|transient)_(403|429)/.test(m))return "rate_limit";
+ if(/nominatim_(?:http|transient)_(0|408|425)/.test(m))return "network_timeout";
+ if(/nominatim_(?:http|transient)_5\\d\\d/.test(m))return "upstream_5xx";
  if(/timeout|timed out|aborterror|network|fetch failed|socket|dns|connection reset/.test(m))return "network_timeout";
  if(/http_429|rate.?limit|too many requests/.test(m))return "rate_limit";
  if(/http_5\\d\\d|\\b5\\d\\d\\b/.test(m))return "upstream_5xx";
@@ -1325,7 +1381,8 @@ Deno.serve(async req=>{
    const msg=e instanceof Error?e.message:(e&&typeof e==="object"?JSON.stringify(e):String(e));
    const policy=runtimeFailurePolicy(msg,Number(job.attempts??0));
    let sourceSlug=job.payload?.source_slug?String(job.payload.source_slug):null;
-   if(!sourceSlug&&/overpass|nominatim/i.test(msg))sourceSlug="openstreetmap_overpass";
+   if(/nominatim/i.test(msg))sourceSlug=null;
+   else if(!sourceSlug&&/overpass/i.test(msg))sourceSlug="openstreetmap_overpass";
    if(sourceSlug&&!policy.blocked){
     try{await db.schema("booked_solid").rpc("record_source_failure",{p_slug:sourceSlug,p_error:msg});}catch{}
    }
