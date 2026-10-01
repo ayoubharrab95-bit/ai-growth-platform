@@ -348,7 +348,7 @@ async function reviewMarkets(){
  ]);
  const qual=new Set((leads??[]).filter((l:any)=>["qualified","message_ready","queued","sent","replied","meeting","won"].includes(l.status)).map((l:any)=>l.company_id));
  for(const m of markets??[]){
-  const cs=(companies??[]).filter((c:any)=>String(c.metadata?.geography||"")===m.display_name);const n=cs.length,q=cs.filter((c:any)=>qual.has(c.id)).length;
+  const cs=(companies??[]).filter((c:any)=>String(c.metadata?.search_market??c.metadata?.source_market??c.metadata?.geography??"")===m.display_name);const n=cs.length,q=cs.filter((c:any)=>qual.has(c.id)).length;
   const score=n?clamp(42+40*(q/n)+Math.min(12,n*0.5)):Number(m.quality_score||50);
   let lifecycle=m.lifecycle_state;if(lifecycle==="testing"&&n>=4)lifecycle=q>=1?"active":"testing";
   await db.schema("booked_solid").from("market_catalog").update({discovered_count:n,qualified_count:q,quality_score:score,lifecycle_state:lifecycle,updated_at:new Date().toISOString()}).eq("id",m.id);
