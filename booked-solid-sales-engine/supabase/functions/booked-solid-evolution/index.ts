@@ -39,7 +39,8 @@ const HUNT_QUERIES=[
 ];
 
 function sourceKind(title:string,desc:string){
- const t=(title+" "+desc).toLowerCase();
+ const tt=title.toLowerCase(),t=(title+" "+desc).toLowerCase();
+ if(/permit|plan review|inspection permit/.test(tt))return "permit";
  return /license|licence|registration|registered/.test(t)?"license":"permit";
 }
 function pickField(human:string[],field:string[],patterns:RegExp[]){
@@ -71,9 +72,33 @@ function detectFieldMap(human:string[],field:string[]){
  map.description=pickField(human,field,[/description/,/scope.*work/,/work.*description/,/project.*description/]);
  return map;
 }
+function sourceTradeHint(title:string,desc:string=""){
+ const t=(title+" "+desc).toLowerCase();
+ if(/plumb|gas permit/.test(t))return "Plumbing";
+ if(/electrical|electrician/.test(t))return "Electrical";
+ if(/hvac|mechanical|heating|air conditioning/.test(t))return "HVAC";
+ if(/roof/.test(t))return "Roofing";
+ if(/paint/.test(t))return "Painting";
+ if(/landscap/.test(t))return "Landscaping";
+ if(/home builder|new home builder|residential builder/.test(t))return "Home Builder";
+ if(/remodel|home improvement/.test(t))return "Remodeling";
+ if(/plan review|general contractor|construction|building permit|contractor license|contractor licence|building contractor/.test(t))return "Construction";
+ return "Mixed";
+}
+function candidateScopeReason(title:string,desc:string=""){
+ const t=(title+" "+desc).toLowerCase();
+ if(/elevator|escalator/.test(t))return "out_of_scope_elevator";
+ if(/asbestos/.test(t))return "out_of_scope_asbestos";
+ if(/\bmold\b/.test(t))return "out_of_scope_mold";
+ if(/water well|well contractor|pump installer/.test(t))return "out_of_scope_water_well";
+ if(/real estate development|real estate developer|property sale|parcel sales/.test(t))return "out_of_scope_real_estate";
+ if(/demolition permits?/.test(t))return "out_of_scope_demolition";
+ return null;
+}
 function relevantDataset(title:string,desc:string){
  const t=(title+" "+desc).toLowerCase();
- return /(permit|license|licence|contractor|construction|building|plumbing|electrical|hvac|mechanical|roof|home improvement)/.test(t)
+ return !candidateScopeReason(title,desc)
+   && /(permit|license|licence|contractor|construction|building|plumbing|electrical|hvac|mechanical|roof|home improvement|builder|remodel|painting|landscap)/.test(t)
    && !/(restaurant|food|liquor|alcohol|marriage|dog license|pet license|retired|deprecated|archive|historical|trust fund|violation|disciplin|complaint|enforcement)/.test(t);
 }
 function inferExistingMarket(text:string,markets:any[]){
@@ -256,6 +281,11 @@ async function validateCandidates(limit=4,maxCanaries=6){
  const {data:list}=await db.schema("booked_solid").from("source_candidates").select("*").in("state",["candidate","retry"]).gte("score",65).order("score",{ascending:false}).order("last_seen_at",{ascending:false}).limit(take);
  let validated=0,promoted=0,rejected=0;
  for(const c of list??[]){
+  const scopeReason=candidateScopeReason(String(c.title||""),String(c.description||""));
+  if(scopeReason){
+   await db.schema("booked_solid").from("source_candidates").update({state:"rejected",rejection_reason:scopeReason,last_validated_at:new Date().toISOString()}).eq("id",c.id);
+   rejected++;continue;
+  }
   await db.schema("booked_solid").from("source_candidates").update({state:"validating",validation_attempts:Number(c.validation_attempts||0)+1}).eq("id",c.id);
   try{
    let p:any=null;
@@ -361,23 +391,35 @@ async function queueCanaries(limit=2){
   return (Number(b.quality_score||50)+Number(b.exploration_weight||1)*8)-(Number(a.quality_score||50)+Number(a.exploration_weight||1)*8);
  });
  if(!autos.length)return 0;
- const {data:strategy}=await db.schema("booked_solid").from("search_strategies").select("*").eq("enabled",true).eq("trade","Mixed").order("performance_score",{ascending:false}).limit(1).maybeSingle();
- if(!strategy)return 0;
  let queued=0;
  for(const s of autos){
   if(queued>=limit)break;
-  const recentSince=new Date(Date.now()-20*3600000).toISOString();
+  const recentSince=new Date(Date.now()-6*3600000).toISOString();
   const {data:recent}=await db.schema("booked_solid").from("work_queue").select("id,status,created_at").eq("kind","discover").contains("payload",{source_slug:s.slug}).gte("created_at",recentSince).limit(1);
   if((recent??[]).length)continue;
-  if(s.last_success_at&&Date.now()-new Date(s.last_success_at).getTime()<20*3600000)continue;
+  if(s.last_success_at&&Date.now()-new Date(s.last_success_at).getTime()<6*3600000)continue;
+
+  const tradeHint=sourceTradeHint(String(s.name||""),String(s.metadata?.source_kind||"")+" "+String(s.metadata?.public_url||""));
+  let strategy:any=null;
+  if(tradeHint!=="Mixed"){
+   const {data:specific}=await db.schema("booked_solid").from("search_strategies").select("*").eq("enabled",true).eq("trade",tradeHint).order("performance_score",{ascending:false}).limit(1).maybeSingle();
+   strategy=specific;
+  }
+  if(!strategy){
+   const {data:mixed}=await db.schema("booked_solid").from("search_strategies").select("*").eq("enabled",true).eq("trade","Mixed").order("performance_score",{ascending:false}).limit(1).maybeSingle();
+   strategy=mixed;
+  }
+  if(!strategy)continue;
+
   const marketName=String(s.metadata?.market_hint||"US");let lat=null,lon=null;
   if(marketName!=="US"){
    const {data:m}=await db.schema("booked_solid").from("market_catalog").select("*").eq("display_name",marketName).maybeSingle();
    if(m){lat=m.latitude;lon=m.longitude}
   }
-  await db.schema("booked_solid").from("work_queue").insert({kind:"discover",priority:72+Number(s.exploration_weight||1),payload:{
-   strategy_id:strategy.id,strategy_slug:strategy.slug,trade:"Mixed",geography:marketName,intent:"source_canary",
-   query_template:strategy.query_template,source_id:s.id,source_slug:s.slug,latitude:lat,longitude:lon,offer_hint:strategy.offer_hint,canary:true
+  await db.schema("booked_solid").from("work_queue").insert({kind:"discover",priority:74+Number(s.exploration_weight||1),payload:{
+   strategy_id:strategy.id,strategy_slug:strategy.slug,trade:tradeHint,geography:marketName,intent:"source_canary",
+   query_template:strategy.query_template,source_id:s.id,source_slug:s.slug,latitude:lat,longitude:lon,offer_hint:strategy.offer_hint,canary:true,
+   canary_trade_hint:tradeHint
   },status:"pending"});
   queued++;
  }
@@ -401,7 +443,7 @@ async function cycle(mode:string){
   if(mode!=="review"){
    if(settings?.source_hunt_enabled!==false)discovered=await huntCycle();
    if(settings?.source_hunt_enabled!==false)validation=await validateCandidates(Number(settings?.max_candidate_validations_per_cycle||5),Number(settings?.max_canary_sources||6));
-   if(settings?.strategy_evolution_enabled!==false)strategies=await evolveStrategies(Number(settings?.max_new_strategies_per_cycle||2),Number(settings?.max_enabled_strategies||180));
+   if(settings?.strategy_evolution_enabled!==false&&mode!=="sources")strategies=await evolveStrategies(Number(settings?.max_new_strategies_per_cycle||2),Number(settings?.max_enabled_strategies||180));
    queued=await queueCanaries(2);
   }
   const notes={source_review:sourceReview,validation};
@@ -436,6 +478,7 @@ Deno.serve(async req=>{
   if(action==="review")return out(await cycle("review"));
   if(action==="cycle")return out(await cycle("cycle"));
   if(action==="hunt")return out(await cycle("hunt"));
-  return out({ok:false,error:"unknown_action",allowed:["health","review","cycle","hunt"]},400);
+  if(action==="sources")return out(await cycle("sources"));
+  return out({ok:false,error:"unknown_action",allowed:["health","review","cycle","hunt","sources"]},400);
  }catch(e){console.error(e);return out({ok:false,error:e instanceof Error?e.message:String(e)},500)}
 });
