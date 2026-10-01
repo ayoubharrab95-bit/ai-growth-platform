@@ -123,6 +123,50 @@ async function queueOneEnrichment(){
   return {job_id:data.id,company_id:next.company_id,lead_id:next.id,lead_status:next.status,lead_score:score,priority,enrichment_target_version:2};
 }
 
+async function queueContactIntelligenceV2(limit=2){
+  const {data:leads}=await db.schema("booked_solid").from("leads")
+    .select("id,company_id,score,priority_band,lead_brief,companies!inner(id,website_url,metadata)")
+    .eq("status","qualified")
+    .order("score",{ascending:false})
+    .limit(200);
+  const rank=(x:any)=>{
+    const band=String(x.priority_band||"standard");
+    const b=band==="hot"?400:band==="high"?300:band==="signal"?200:100;
+    const state=String(x.lead_brief?.contact_resolution?.state||"contact_required");
+    const gap=["contact_required","weak_only","phone_available","contact_form_available"].includes(state)?50:0;
+    return b+gap+Number(x.score||0);
+  };
+  const pool=(leads??[])
+    .filter((x:any)=>Boolean(x.companies?.website_url)&&Number(x.companies?.metadata?.contact_intelligence_version||0)<2)
+    .sort((a:any,b:any)=>rank(b)-rank(a))
+    .slice(0,Math.max(1,limit));
+  const queued:any[]=[];
+  for(const lead of pool){
+    const priority=70+Math.min(20,Number(lead.score||0)*0.15);
+    const {data:existing}=await db.schema("booked_solid").from("work_queue")
+      .select("id,payload,priority,available_at")
+      .eq("kind","contact").eq("status","pending")
+      .contains("payload",{lead_id:lead.id})
+      .order("created_at",{ascending:false}).limit(1);
+    if((existing??[]).length){
+      const row=existing![0];
+      const payload={...(row.payload??{}),lead_id:lead.id,company_id:lead.company_id,reason:"contact_intelligence_v2_backfill",force_contact_intelligence_v2:true};
+      const {data:u}=await db.schema("booked_solid").from("work_queue")
+        .update({priority,available_at:new Date().toISOString(),payload,updated_at:new Date().toISOString()})
+        .eq("id",row.id).select("id,priority,payload").single();
+      if(u)queued.push({job_id:u.id,lead_id:lead.id,company_id:lead.company_id,accelerated_existing:true,priority});
+    }else{
+      const {data:i,error}=await db.schema("booked_solid").from("work_queue").insert({
+        kind:"contact",priority,payload:{lead_id:lead.id,company_id:lead.company_id,contact_retry:0,reason:"contact_intelligence_v2_backfill",force_contact_intelligence_v2:true},
+        status:"pending",available_at:new Date().toISOString()
+      }).select("id,priority,payload").single();
+      if(error)throw error;
+      if(i)queued.push({job_id:i.id,lead_id:lead.id,company_id:lead.company_id,accelerated_existing:false,priority});
+    }
+  }
+  return queued;
+}
+
 async function planCycle(body: any) {
   const { data: settings } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).single();
   if (!settings?.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
@@ -239,10 +283,12 @@ async function planCycle(body: any) {
 
   if(!routed.length){
     const enrichment=await queueOneEnrichment();
+    const contactIntel=await queueContactIntelligenceV2(2);
     return json({
       ok:true,mode:"planner",queued:0,paused:true,reason:"no_compatible_free_source_available",
       email_gate:"blocked_until_email_configuration",
       enrichment_queued:enrichment,
+      contact_intelligence_queued:contactIntel,
       discovery_preserved:true,
       source_health:{
         healthy_enabled_sources:sources.length,
@@ -271,6 +317,7 @@ async function planCycle(body: any) {
     if(m)await db.schema("booked_solid").from("market_catalog").update({uses_count:Number(m.uses_count??0)+1,last_used_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",m.id);
   }
   const enrichment=await queueOneEnrichment();
+  const contactIntel=await queueContactIntelligenceV2(2);
 
   return json({
     ok: true,
@@ -278,6 +325,7 @@ async function planCycle(body: any) {
     email_gate: "blocked_until_email_configuration",
     queued: queued?.length ?? 0,
     enrichment_queued: enrichment,
+    contact_intelligence_queued: contactIntel,
     discovery_preserved: true,
     enrichment_is_additive_not_a_gate: true,
     source_health: {
