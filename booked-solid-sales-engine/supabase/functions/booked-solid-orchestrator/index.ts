@@ -143,6 +143,7 @@ async function planCycle(body: any) {
   const sourceBySlug=new Map((sources??[]).map((x:any)=>[x.slug,x]));
   const osmSource=sourceBySlug.get("openstreetmap_overpass");
   const nrcaSource=sourceBySlug.get("nrca_official");
+  const usaSpendingSource=sourceBySlug.get("usaspending_api");
   const chicagoPermitSource=sourceBySlug.get("chicago_building_permits");
   const nycPermitSource=sourceBySlug.get("nyc_dob_permits");
   const austinPermitSource=sourceBySlug.get("austin_construction_permits");
@@ -152,67 +153,103 @@ async function planCycle(body: any) {
   const philadelphiaPermitSource=sourceBySlug.get("philadelphia_permit_contractors");
   const philadelphiaTradeLicenseSource=sourceBySlug.get("philadelphia_trade_licenses");
   const denverPermitSource=sourceBySlug.get("denver_commercial_permits");
-  const usaSpendingSource=sourceBySlug.get("usaspending_api");
+  const citySources=[chicagoPermitSource,nycPermitSource,austinPermitSource,seattlePermitSource,bostonPermitSource,sfPermitSource,philadelphiaPermitSource,philadelphiaTradeLicenseSource,denverPermitSource].filter(Boolean);
   const autoActiveSources=(sources??[]).filter((x:any)=>["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||""))&&x.lifecycle_state==="active").sort((a:any,b:any)=>(Number(b.quality_score||50)+Number(b.exploration_weight||1)*8)-(Number(a.quality_score||50)+Number(a.exploration_weight||1)*8));
   const osmTrades=new Set(["Roofing","Commercial Roofing","HVAC","Commercial HVAC","Plumbing","Electrical","Painting","Flooring","Landscaping","General Contractor","Commercial Contractor","Construction","Windows","Deck Builder","Deck Patio","Cabinet","Remodeling","Bathroom Remodeling","Kitchen Remodeling","Kitchen Bath Remodeling","Home Builder","Custom Home Builder","Siding","Concrete","Mixed","Property Operations"]);
+  const discoveryCapable=(source:any,trade:string,market:string)=>{
+    if(!source)return false;
+    const slug=String(source.slug||"");
+    if(slug==="openstreetmap_overpass")return osmTrades.has(trade);
+    if(slug==="nrca_official")return ["Roofing","Commercial Roofing"].includes(trade);
+    if(slug==="usaspending_api")return true;
+    const adapter=String(source.metadata?.adapter||"");
+    if(["generic_socrata","generic_arcgis"].includes(adapter)){
+      const sm=String(source.metadata?.market_hint||source.metadata?.market||"");
+      return !sm||sm===market;
+    }
+    const sm=String(source.metadata?.market_hint||source.metadata?.market||"");
+    if(citySources.some((x:any)=>x?.slug===slug))return Boolean(sm)&&sm===market;
+    return false;
+  };
+  const chooseBaseSource=(s:any)=>{
+    const trade=String(s.trade||"Mixed"),market=String(s.target_location||"US");
+    if(discoveryCapable(osmSource,trade,market))return osmSource;
+    const city=citySources.find((x:any)=>discoveryCapable(x,trade,market));if(city)return city;
+    const generic=autoActiveSources.find((x:any)=>discoveryCapable(x,trade,market));if(generic)return generic;
+    if(discoveryCapable(usaSpendingSource,trade,market))return usaSpendingSource;
+    if(discoveryCapable(nrcaSource,trade,market))return nrcaSource;
+    return null;
+  };
   if (!strategies.length) {
     return json({ ok: true, paused: true, reason: "no_strategy_available" }, 200);
   }
-  const fallbackSource=osmSource??autoActiveSources[0]??usaSpendingSource??nrcaSource??chicagoPermitSource??nycPermitSource??austinPermitSource??seattlePermitSource??bostonPermitSource??sfPermitSource??philadelphiaPermitSource??philadelphiaTradeLicenseSource??denverPermitSource;
-  if(!fallbackSource){
+
+  const routed = strategies.map((s:any)=>{
+    const useCount=Number(s.uses_count??0);
+    const trade=String(s.trade||"Mixed"),market=String(s.target_location||"US");
+    let source:any=chooseBaseSource(s);
+    if(!source)return null;
+
+    const compatibleGeneric=autoActiveSources.filter((x:any)=>discoveryCapable(x,trade,market));
+    const cityForMarket=citySources.find((x:any)=>discoveryCapable(x,trade,market));
+    if(compatibleGeneric.length && useCount%10===8) source=compatibleGeneric[(hashText(String(s.slug)+":"+useCount))%compatibleGeneric.length];
+    else if(cityForMarket && useCount%4===2) source=cityForMarket;
+    else if(["Roofing","Commercial Roofing"].includes(trade) && discoveryCapable(nrcaSource,trade,market) && useCount%8===7) source=nrcaSource;
+    else if(trade==="Mixed" && discoveryCapable(usaSpendingSource,trade,market) && useCount%6===5) source=usaSpendingSource;
+
+    if(!discoveryCapable(source,trade,market))return null;
+    const jobMarket=String(source?.metadata?.market_hint||source?.metadata?.market||market);
+    const [jobLat,jobLon]=coordsFor(jobMarket,marketRows??[]);
+    return {strategy:s,job:{
+      kind:"discover",
+      priority:Math.max(1,Number(s.planner_score)),
+      payload:{
+        strategy_id:s.id,
+        strategy_slug:s.slug,
+        trade:s.trade,
+        geography:jobMarket,
+        intent:s.intent,
+        query_template:s.query_template,
+        source_id:source.id,
+        source_slug:source.slug,
+        latitude:jobLat,
+        longitude:jobLon,
+        offer_hint:s.offer_hint,
+        evolution_source:Boolean(source?.metadata?.discovered_by==="self_evolution")
+      },
+      status:"pending",
+      available_at:new Date().toISOString()
+    }};
+  }).filter(Boolean) as any[];
+
+  if(!routed.length){
+    const enrichment=await queueOneEnrichment();
     return json({
-      ok:true,paused:true,reason:"all_free_sources_cooling_or_unavailable",
-      cooling_sources:coolingSources.map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
+      ok:true,mode:"planner",queued:0,paused:true,reason:"no_compatible_free_source_available",
+      email_gate:"blocked_until_email_configuration",
+      enrichment_queued:enrichment,
+      discovery_preserved:true,
+      source_health:{
+        healthy_enabled_sources:sources.length,
+        cooling_enabled_sources:coolingSources.length,
+        cooling_sources:coolingSources.slice(0,8).map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
+      },
+      skipped_strategies:strategies.map((s:any)=>({slug:s.slug,trade:s.trade,market:s.target_location}))
     },200);
   }
-  const jobs = strategies.map((s: any) => {
-    const useCount=Number(s.uses_count??0);
-    let source:any=fallbackSource;
-    if(autoActiveSources.length && useCount%10===8) source=autoActiveSources[(hashText(String(s.slug)+":"+useCount))%autoActiveSources.length];
-    else if(s.target_location==="Chicago IL" && chicagoPermitSource && useCount%4===2) source=chicagoPermitSource;
-    else if(s.target_location==="New York NY" && nycPermitSource && useCount%4===2) source=nycPermitSource;
-    else if(s.target_location==="Austin TX" && austinPermitSource && useCount%4===2) source=austinPermitSource;
-    else if(s.target_location==="Seattle WA" && seattlePermitSource && useCount%4===2) source=seattlePermitSource;
-    else if(s.target_location==="Boston MA" && bostonPermitSource && useCount%4===2) source=bostonPermitSource;
-    else if(s.target_location==="San Francisco CA" && sfPermitSource && useCount%4===2) source=sfPermitSource;
-    else if(s.target_location==="Philadelphia PA" && philadelphiaTradeLicenseSource && useCount%6===4) source=philadelphiaTradeLicenseSource;
-    else if(s.target_location==="Philadelphia PA" && philadelphiaPermitSource && useCount%6===2) source=philadelphiaPermitSource;
-    else if(s.target_location==="Denver CO" && denverPermitSource && useCount%4===2) source=denverPermitSource;
-    else if(["Roofing","Commercial Roofing"].includes(String(s.trade)) && nrcaSource && useCount%8===7) source=nrcaSource;
-    else if(String(s.trade)==="Mixed" && usaSpendingSource && useCount%6===5) source=usaSpendingSource;
-    else if(!osmTrades.has(String(s.trade)) && usaSpendingSource) source=usaSpendingSource;
-    const jobMarket=String(source?.metadata?.market_hint||source?.metadata?.market||s.target_location);
-    const [jobLat,jobLon]=coordsFor(jobMarket,marketRows??[]);
-    return {
-    kind: "discover",
-    priority: Math.max(1, Number(s.planner_score)),
-    payload: {
-      strategy_id: s.id,
-      strategy_slug: s.slug,
-      trade: s.trade,
-      geography: jobMarket,
-      intent: s.intent,
-      query_template: s.query_template,
-      source_id: source.id,
-      source_slug: source.slug,
-      latitude: jobLat,
-      longitude: jobLon,
-      offer_hint: s.offer_hint,
-      evolution_source: Boolean(source?.metadata?.discovered_by==="self_evolution")
-    },
-    status: "pending",
-    available_at: new Date().toISOString(),
-  }});
 
-  const { data: queued, error } = await db
-    .schema("booked_solid")
-    .from("work_queue")
-    .insert(jobs)
-    .select("id,kind,priority,payload");
-
+  const jobs=routed.map((x:any)=>x.job);
+  const { data: queued, error } = await db.schema("booked_solid").from("work_queue").insert(jobs).select("id,kind,priority,payload");
   if (error) throw error;
 
-  await Promise.all(strategies.map((s:any)=>db.schema("booked_solid").from("search_strategies").update({last_used_at:new Date().toISOString(),uses_count:Number(s.uses_count??0)+1,metadata:{...(s.metadata??{}),last_market:s.target_location}}).eq("id",s.id)));
+  await Promise.all(routed.map((x:any)=>{
+    const s=x.strategy;
+    return db.schema("booked_solid").from("search_strategies").update({
+      last_used_at:new Date().toISOString(),
+      uses_count:Number(s.uses_count??0)+1,
+      metadata:{...(s.metadata??{}),last_market:s.target_location}
+    }).eq("id",s.id);
+  }));
   for(const j of queued??[]){
     const mn=String(j.payload?.geography||"");if(!mn)continue;
     const m=(marketRows??[]).find((x:any)=>x.display_name===mn);
