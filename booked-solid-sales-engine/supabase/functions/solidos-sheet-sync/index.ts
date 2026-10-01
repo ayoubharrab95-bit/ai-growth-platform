@@ -348,7 +348,7 @@ async function writeTab(id:string,sm:any,name:string,rows:any[][],token:string,m
   if(sm[name]===undefined)throw new Error("CORE:missing_tab:"+name);
   await writeAnyTab(id,sm,name,rows,token,maxRows,maxCols);
 }
-async function coreSync(token:string){
+async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any={}){
   const id=TARGETS.CORE_CRM.id;
   let meta=await sheetMetadata(id,token);
   let sm=sheetIdMap(meta);
@@ -358,6 +358,30 @@ async function coreSync(token:string){
     sm=sheetIdMap(meta);
   }
   const nowIso=new Date().toISOString();
+  const changed=new Set<string>();
+  for(const t of ["companies","leads","contacts","evidence","messages","priority"]){
+    if(changePayload?.["changed_"+t]===true)changed.add(t);
+  }
+  if(changePayload?.table)changed.add(String(changePayload.table));
+  let fullMode=mode==="full";
+  if(!fullMode&&changed.size===0)fullMode=true;
+  const tabDeps:Record<string,string[]>={
+    "COMMAND CENTER":["companies","leads","contacts","evidence","messages","priority"],
+    "ACTION QUEUE":["leads","contacts"],
+    "TRADE SUMMARY":["leads"],
+    "QUALIFIED 360":["leads","contacts","evidence"],
+    "ALL LEADS":["leads"],
+    "COMPANIES":["companies"],
+    "CONTACTS":["contacts"],
+    "MESSAGES":["messages"],
+    "EVIDENCE":["evidence"],
+    "CONTACT GAPS":["leads","contacts"],
+    "DATA QUALITY":["leads","contacts","evidence","messages"],
+    "HOURLY LOG":[],
+    "SYSTEM STATUS":["companies","leads","contacts","evidence","messages","priority"],
+    "PRIORITY ENGINE":["leads","priority"]
+  };
+  const wants=(tab:string)=>fullMode||(tabDeps[tab]||[]).some(t=>changed.has(t));
 
   const [companies,leads,contacts,evidence,messages,settingsRows,work,sourceRows,strategyRows,priorityYieldRows,priorityEnrichmentRows,sourceLeadYieldRows]=await Promise.all([
     fetchAllBooked("companies","*","updated_at",false),
@@ -656,7 +680,7 @@ async function coreSync(token:string){
   ];
 
   const sys=[["Metric","Value"],
-    ["Snapshot",nowIso],["Writer","SolidOS Native Sheets"],["Sync cadence","~2 minutes when data changes"],
+    ["Snapshot",nowIso],["Writer","SolidOS Native Sheets"],["Sync cadence","Event-driven fast sync + verified full reconciliation"],
     ["Search",settings.search_enabled?"ON":"OFF"],["Email",settings.email_enabled?"ON":"OFF"],["SMS",settings.sms_enabled?"ON":"OFF"],["Buyer outreach","OFF"],
     ["Companies",companies.length],["Leads",leads.length],["Qualified",qualified.length],["Candidates",candidates.length],
     ["Email Ready",ready.length],["Contact Form Routes",contactForms.length],["Phone Only Routes",phoneOnly.length],["Named Decision Makers",namedDM],
@@ -668,20 +692,26 @@ async function coreSync(token:string){
     ["Data Quality",warningCount===0?"PASS":"WARNING"],["Warnings",warningCount]
   ];
 
-  await writeTab(id,sm,"COMMAND CENTER",command,token,200,12);
-  await writeTab(id,sm,"ACTION QUEUE",aq,token,500,17);
-  await writeTab(id,sm,"TRADE SUMMARY",trade,token,200,11);
-  await writeTab(id,sm,"QUALIFIED 360",q360,token,300,18);
-  await writeTab(id,sm,"ALL LEADS",allLeads,token,500,18);
-  await writeTab(id,sm,"COMPANIES",compRows,token,1000,20);
-  await writeTab(id,sm,"CONTACTS",contRows,token,1000,20);
-  await writeTab(id,sm,"MESSAGES",msgRows,token,1500,15);
-  await writeTab(id,sm,"EVIDENCE",evidenceRows,token,3200,10);
-  await writeTab(id,sm,"CONTACT GAPS",gaps,token,500,10);
-  await writeTab(id,sm,"DATA QUALITY",dq,token,500,10);
-  await writeTab(id,sm,"HOURLY LOG",logRows,token,1000,24);
-  await writeTab(id,sm,"SYSTEM STATUS",sys,token,300,10);
-  await writeTab(id,sm,"PRIORITY ENGINE",priorityEngine,token,1000,11);
+  const writtenTabs:string[]=[];
+  const writeIf=async(tab:string,rows:any[][],minRows:number,maxCols:number)=>{
+    if(!wants(tab))return;
+    await writeTab(id,sm,tab,rows,token,minRows,maxCols);
+    writtenTabs.push(tab);
+  };
+  await writeIf("COMMAND CENTER",command,200,12);
+  await writeIf("ACTION QUEUE",aq,500,17);
+  await writeIf("TRADE SUMMARY",trade,200,11);
+  await writeIf("QUALIFIED 360",q360,300,18);
+  await writeIf("ALL LEADS",allLeads,500,18);
+  await writeIf("COMPANIES",compRows,1000,20);
+  await writeIf("CONTACTS",contRows,1000,20);
+  await writeIf("MESSAGES",msgRows,1500,15);
+  await writeIf("EVIDENCE",evidenceRows,3200,10);
+  await writeIf("CONTACT GAPS",gaps,500,10);
+  await writeIf("DATA QUALITY",dq,500,10);
+  if(fullMode)await writeIf("HOURLY LOG",logRows,1000,24);
+  await writeIf("SYSTEM STATUS",sys,300,10);
+  await writeIf("PRIORITY ENGINE",priorityEngine,1000,11);
 
   const check=await readValues(id,"COMMAND CENTER!A1:H25",token);
   if(String(check.values?.[0]?.[0]||"")!=="BOOKED SOLID — COMMAND CENTER")throw new Error("CORE:verify_command_header");
@@ -691,35 +721,42 @@ async function coreSync(token:string){
   if(Number(check.values?.[2]?.[7]||-1)!==candidates.length)throw new Error("CORE:verify_candidate_count");
 
   const verification:any[]=[];
-  verification.push(await verifyHeaderAndCount(id,"ACTION QUEUE","Company",qualified.length,token));
-  verification.push(await verifyHeaderAndCount(id,"QUALIFIED 360","Company",qualified.length,token));
-  verification.push(await verifyHeaderAndCount(id,"ALL LEADS","Company",leads.length,token));
-  verification.push(await verifyHeaderAndCount(id,"COMPANIES","Company",companies.length,token));
-  verification.push(await verifyHeaderAndCount(id,"CONTACTS","Company",contacts.length,token));
-  verification.push(await verifyHeaderAndCount(id,"MESSAGES","Company",messages.length,token));
-  verification.push(await verifyHeaderAndCount(id,"EVIDENCE","Company",evidence.length,token));
+  if(wants("ACTION QUEUE"))verification.push(await verifyHeaderAndCount(id,"ACTION QUEUE","Company",qualified.length,token));
+  if(wants("QUALIFIED 360"))verification.push(await verifyHeaderAndCount(id,"QUALIFIED 360","Company",qualified.length,token));
+  if(wants("ALL LEADS"))verification.push(await verifyHeaderAndCount(id,"ALL LEADS","Company",leads.length,token));
+  if(wants("COMPANIES"))verification.push(await verifyHeaderAndCount(id,"COMPANIES","Company",companies.length,token));
+  if(wants("CONTACTS"))verification.push(await verifyHeaderAndCount(id,"CONTACTS","Company",contacts.length,token));
+  if(wants("MESSAGES"))verification.push(await verifyHeaderAndCount(id,"MESSAGES","Company",messages.length,token));
+  if(wants("EVIDENCE"))verification.push(await verifyHeaderAndCount(id,"EVIDENCE","Company",evidence.length,token));
 
-  const tradeCheck=await readValues(id,"TRADE SUMMARY!A1:F1",token);
-  if(String(tradeCheck.values?.[0]?.[0]||"")!=="Trade"||String(tradeCheck.values?.[0]?.[1]||"")!=="Qualified")throw new Error("CORE:verify_trade_summary_header");
-
-  const postAQ=await readValues(id,"ACTION QUEUE!A2:Q",token);
-  const postManual=new Map<string,any[]>();
-  for(const r of postAQ.values||[]){
-    const leadId=r?.[15];
-    if(leadId)postManual.set(String(leadId),[r?.[11]||"Not Reviewed",r?.[12]||"",r?.[13]||"",r?.[14]||""]);
+  if(wants("TRADE SUMMARY")){
+    const tradeCheck=await readValues(id,"TRADE SUMMARY!A1:F1",token);
+    if(String(tradeCheck.values?.[0]?.[0]||"")!=="Trade"||String(tradeCheck.values?.[0]?.[1]||"")!=="Qualified")throw new Error("CORE:verify_trade_summary_header");
   }
-  for(const [leadId,before] of manual.entries()){
-    const after=postManual.get(leadId);
-    if(!after)continue;
-    if(before.some((v:any,i:number)=>String(v??"")!==String(after[i]??""))){
-      throw new Error("CORE:manual_fields_changed:"+leadId);
+
+  if(wants("ACTION QUEUE")){
+    const postAQ=await readValues(id,"ACTION QUEUE!A2:Q",token);
+    const postManual=new Map<string,any[]>();
+    for(const r of postAQ.values||[]){
+      const leadId=r?.[15];
+      if(leadId)postManual.set(String(leadId),[r?.[11]||"Not Reviewed",r?.[12]||"",r?.[13]||"",r?.[14]||""]);
+    }
+    for(const [leadId,before] of manual.entries()){
+      const after=postManual.get(leadId);
+      if(!after)continue;
+      if(before.some((v:any,i:number)=>String(v??"")!==String(after[i]??""))){
+        throw new Error("CORE:manual_fields_changed:"+leadId);
+      }
     }
   }
 
-  const priorityCheck=await readValues(id,"PRIORITY ENGINE!A1:K4",token);
-  if(String(priorityCheck.values?.[0]?.[0]||"")!=="PRIORITY YIELD ENGINE")throw new Error("CORE:verify_priority_engine_header");
+  if(wants("PRIORITY ENGINE")){
+    const priorityCheck=await readValues(id,"PRIORITY ENGINE!A1:K4",token);
+    if(String(priorityCheck.values?.[0]?.[0]||"")!=="PRIORITY YIELD ENGINE")throw new Error("CORE:verify_priority_engine_header");
+  }
 
-  return {ok:true,companies:companies.length,leads:leads.length,qualified:qualified.length,candidates:candidates.length,
+  return {ok:true,mode:fullMode?"full":"fast",changed:[...changed],written_tabs:writtenTabs,
+    companies:companies.length,leads:leads.length,qualified:qualified.length,candidates:candidates.length,
     ready:ready.length,contact_forms:contactForms.length,phone_only:phoneOnly.length,contacts:contacts.length,evidence:evidence.length,
     due_work:dueNow,running_work:runningWork,command_rows:(check.values||[]).length,verification};
 }
@@ -733,11 +770,14 @@ async function syncPending(token:string){
 
     try{
       let result:any;
-      if(req.sync_scope==="CORE_CRM")result=await coreSync(token);
+      if(req.sync_scope==="CORE_CRM"){
+        const forceFull=req.reason==="hourly_full_refresh"||req.payload?.force_full===true||req.payload?.requested_by==="manual_full_refresh";
+        result=await coreSync(token,forceFull?"full":"fast",req.payload||{});
+      }
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v19",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v20",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
@@ -779,7 +819,7 @@ Deno.serve(async(req)=>{
       return out(result);
     }
     if(action==="sync-core"){
-      const result=await coreSync(token);
+      const result=await coreSync(token,"full",{force_full:true});
       return out(result);
     }
     if(action==="sync-pending"){
