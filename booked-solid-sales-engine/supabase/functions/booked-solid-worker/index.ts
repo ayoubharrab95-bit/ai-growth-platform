@@ -1387,7 +1387,8 @@ Deno.serve(async req=>{
    else if(job.kind==="message")result=await message(job);
    else if(job.kind==="resolve")result=await resolveCompany(job);
    else result={skipped:job.kind};
-   await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,updated_at:new Date().toISOString()}).eq("id",job.id);
+   const {error:doneErr}=await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,locked_at:null,locked_by:null,updated_at:new Date().toISOString()}).eq("id",job.id);
+   if(doneErr)throw doneErr;
    results.push({ok:true,job_id:job.id,kind:job.kind,result});
   }catch(e){
    const msg=e instanceof Error?e.message:(e&&typeof e==="object"?JSON.stringify(e):String(e));
