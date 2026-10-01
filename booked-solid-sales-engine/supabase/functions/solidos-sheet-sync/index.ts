@@ -288,7 +288,13 @@ async function writeTab(id:string,sm:any,name:string,rows:any[][],token:string,m
 }
 async function coreSync(token:string){
   const id=TARGETS.CORE_CRM.id;
-  const meta=await sheetMetadata(id,token), sm=sheetIdMap(meta);
+  let meta=await sheetMetadata(id,token);
+  let sm=sheetIdMap(meta);
+  if(sm["PRIORITY ENGINE"]===undefined){
+    await batchUpdate(id,[{addSheet:{properties:{title:"PRIORITY ENGINE",gridProperties:{rowCount:1000,columnCount:12,frozenRowCount:7}}}}],token);
+    meta=await sheetMetadata(id,token);
+    sm=sheetIdMap(meta);
+  }
   const nowIso=new Date().toISOString();
 
   const [companies,leads,contacts,evidence,messages,settingsRows,work,sourceRows,strategyRows,priorityYieldRows,priorityEnrichmentRows]=await Promise.all([
