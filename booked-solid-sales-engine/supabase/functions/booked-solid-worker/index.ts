@@ -628,8 +628,8 @@ async function research(job:any){
  const root=new URL(c.website_url);if(root.protocol!=="https:")throw new Error("HTTPS_REQUIRED");
  const paths=["/","/about","/services","/contact","/team","/estimate","/careers","/locations","/commercial"];
  let combined="";let pages=0;const emails=new Set<string>();const phones=new Map<string,any>();let structuredLocation:any=null;
- const pageResults=await Promise.all(paths.map(async p=>{try{const r=await fetch(new URL(p,root),{redirect:"follow",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});if(!r.ok)return null;const h=await r.text();return {p,h,url:new URL(p,root).toString(),visible:clean(h)};}catch{return null;}}));
- for(const pg of pageResults){if(!pg)continue;pages++;combined+=" "+pg.visible;const pageLoc=jsonLdLocation(pg.h,pg.url);if(pageLoc&&!structuredLocation)structuredLocation=pageLoc;for(const e of pg.visible.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[]){const em=e.toLowerCase();const ed=em.split("@")[1];const hd=root.hostname.toLowerCase().replace(/^www\./,"");if(ed===hd||ed.endsWith("."+hd))emails.add(em);}for(const ph of extractPhoneCandidates(pg.visible,pg.url,pg.p)){const prev=phones.get(ph.phone);if(!prev||Number(ph.phone_confidence)>Number(prev.phone_confidence))phones.set(ph.phone,ph);}}
+ const pageResults=await Promise.all(paths.map(async p=>{try{const r=await fetch(new URL(p,root),{redirect:"follow",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});if(!r.ok)return null;const declared=Number(r.headers.get("content-length")||0);if(Number.isFinite(declared)&&declared>1500000)return null;const raw=await r.text();const h=raw.slice(0,300000);const visible=clean(h).slice(0,80000);return {p,h,url:new URL(p,root).toString(),visible};}catch{return null;}}));
+ for(const pg of pageResults){if(!pg)continue;pages++;combined=(combined+" "+pg.visible).slice(0,500000);const pageLoc=jsonLdLocation(pg.h,pg.url);if(pageLoc&&!structuredLocation)structuredLocation=pageLoc;for(const e of pg.visible.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[]){const em=e.toLowerCase();const ed=em.split("@")[1];const hd=root.hostname.toLowerCase().replace(/^www\./,"");if(ed===hd||ed.endsWith("."+hd))emails.add(em);}for(const ph of extractPhoneCandidates(pg.visible,pg.url,pg.p)){const prev=phones.get(ph.phone);if(!prev||Number(ph.phone_confidence)>Number(prev.phone_confidence))phones.set(ph.phone,ph);}}
  const home=pageResults.find((x:any)=>x?.p==="/");if(home){const mt=String(home.h).match(/<title[^>]*>([\s\S]*?)<\/title>/i);const ht=mt?clean(mt[1]).replace(/\s*[|–-]\s*.*$/,"").trim():"";const weak=/^(estimator|careers?|jobs?|free estimate|request a quote|home)$/i.test(String(c.name||""));if(ht&&ht.length>=3&&ht.length<120&&(weak||!c.name)){await db.schema("booked_solid").from("companies").update({name:ht,normalized_name:normalize(ht)}).eq("id",c.id);c.name=ht;}}
  const domain=root.hostname.replace(/^www\./,"").toLowerCase();
  const missingName=!c.name||/^free |^do |^how |^what |^the best|^best /i.test(c.name);
@@ -822,4 +822,74 @@ async function message(job:any){
  if(!r.ok)throw new Error("message_prep_http_"+r.status+":"+String(data?.error||txt).slice(0,500));
  return data;
 }
-Deno.serve(async req=>{try{if(req.method==="OPTIONS")return new Response("ok",{headers:H});await db.schema("booked_solid").from("work_queue").update({status:"pending",locked_at:null,locked_by:null,available_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("status","running").lt("locked_at",new Date(Date.now()-15*60000).toISOString());const {data:jobs,error}=await db.rpc("claim_booked_solid_work",{p_worker:"booked-solid-"+crypto.randomUUID()});if(error)throw error;const job=jobs?.[0];if(!job)return out({ok:true,idle:true});let result:any;try{if(job.kind==="discover")result=await discover(job);else if(job.kind==="research")result=await research(job);else if(job.kind==="location")result=await locationEnrich(job);else if(job.kind==="qualify")result=await qualify(job);else if(job.kind==="contact")result=await contactResolve(job);else if(job.kind==="message")result=await message(job);else if(job.kind==="resolve")result=await resolveCompany(job);else result={skipped:job.kind};await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,updated_at:new Date().toISOString()}).eq("id",job.id);return out({ok:true,job_id:job.id,kind:job.kind,result});}catch(e){const msg=e instanceof Error?e.message:(e&&typeof e==="object"?JSON.stringify(e):String(e));const blocked=msg.includes("SEARCH_PROVIDER_NOT_CONFIGURED");const retry=!blocked&&Number(job.attempts??0)<3;if(job.kind==="discover"&&job.payload?.source_slug)await db.schema("booked_solid").rpc("record_source_failure",{p_slug:job.payload.source_slug,p_error:msg});await db.schema("booked_solid").from("work_queue").update({status:blocked?"blocked":retry?"pending":"failed",last_error:msg,available_at:new Date(Date.now()+600000).toISOString(),locked_at:null,locked_by:null,updated_at:new Date().toISOString()}).eq("id",job.id);return out({ok:false,job_id:job.id,kind:job.kind,blocked,retry,error:msg},blocked?424:500);}}catch(e){console.error(e);return out({ok:false,error:String(e)},500)}});
+function classifyRuntimeFailure(msg:string){
+ const m=String(msg||"").toLowerCase();
+ if(/overpass_http_(0|406|408|425|429|5\\d\\d)/.test(m)||/overpass_fallback_failed:overpass_http_(0|406|408|425|429|5\\d\\d)/.test(m))return "overpass_transient";
+ if(/timeout|timed out|aborterror|network|fetch failed|socket|dns|connection reset/.test(m))return "network_timeout";
+ if(/http_429|rate.?limit|too many requests/.test(m))return "rate_limit";
+ if(/http_5\\d\\d|\\b5\\d\\d\\b/.test(m))return "upstream_5xx";
+ if(/http_401|unauthorized/.test(m))return "auth_401";
+ if(/http_403|forbidden/.test(m))return "auth_403";
+ if(/http_404|not found/.test(m))return "not_found";
+ if(/schema|column|unsupported_provider|no_company_layer|invalid field/.test(m))return "schema_or_adapter";
+ if(/http_4\\d\\d|\\b4\\d\\d\\b/.test(m))return "upstream_4xx";
+ return "unknown";
+}
+function runtimeFailurePolicy(msg:string,attempts:number){
+ const failureClass=classifyRuntimeFailure(msg);
+ const transient=["overpass_transient","network_timeout","rate_limit","upstream_5xx"].includes(failureClass);
+ const blocked=String(msg||"").includes("SEARCH_PROVIDER_NOT_CONFIGURED");
+ const maxAttempts=transient?5:3;
+ const retry=!blocked&&Number(attempts||0)<maxAttempts;
+ let delayMinutes=30;
+ if(failureClass==="rate_limit")delayMinutes=Math.min(180,30*Math.max(1,attempts));
+ else if(failureClass==="overpass_transient"||failureClass==="network_timeout")delayMinutes=[10,20,40,60,120][Math.min(4,Math.max(0,attempts-1))];
+ else if(failureClass==="upstream_5xx")delayMinutes=[15,30,60,120,180][Math.min(4,Math.max(0,attempts-1))];
+ else if(["auth_401","auth_403","not_found","schema_or_adapter","upstream_4xx"].includes(failureClass))delayMinutes=60;
+ return {failureClass,transient,blocked,maxAttempts,retry,delayMinutes};
+}
+Deno.serve(async req=>{
+ try{
+  if(req.method==="OPTIONS")return new Response("ok",{headers:H});
+  await db.schema("booked_solid").from("work_queue").update({status:"pending",locked_at:null,locked_by:null,available_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("status","running").lt("locked_at",new Date(Date.now()-15*60000).toISOString());
+  const {data:jobs,error}=await db.rpc("claim_booked_solid_work",{p_worker:"booked-solid-"+crypto.randomUUID()});
+  if(error)throw error;
+  const job=jobs?.[0];
+  if(!job)return out({ok:true,idle:true});
+  let result:any;
+  try{
+   if(job.kind==="discover")result=await discover(job);
+   else if(job.kind==="research")result=await research(job);
+   else if(job.kind==="location")result=await locationEnrich(job);
+   else if(job.kind==="qualify")result=await qualify(job);
+   else if(job.kind==="contact")result=await contactResolve(job);
+   else if(job.kind==="message")result=await message(job);
+   else if(job.kind==="resolve")result=await resolveCompany(job);
+   else result={skipped:job.kind};
+   await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,updated_at:new Date().toISOString()}).eq("id",job.id);
+   return out({ok:true,job_id:job.id,kind:job.kind,result});
+  }catch(e){
+   const msg=e instanceof Error?e.message:(e&&typeof e==="object"?JSON.stringify(e):String(e));
+   const policy=runtimeFailurePolicy(msg,Number(job.attempts??0));
+   let sourceSlug=job.payload?.source_slug?String(job.payload.source_slug):null;
+   if(!sourceSlug&&/overpass|nominatim/i.test(msg))sourceSlug="openstreetmap_overpass";
+   if(sourceSlug&&!policy.blocked){
+    try{await db.schema("booked_solid").rpc("record_source_failure",{p_slug:sourceSlug,p_error:msg});}catch{}
+   }
+   await db.schema("booked_solid").from("work_queue").update({
+    status:policy.blocked?"blocked":policy.retry?"pending":"failed",
+    last_error:msg,
+    available_at:new Date(Date.now()+policy.delayMinutes*60000).toISOString(),
+    locked_at:null,locked_by:null,updated_at:new Date().toISOString()
+   }).eq("id",job.id);
+   return out({
+    ok:false,job_id:job.id,kind:job.kind,blocked:policy.blocked,retry:policy.retry,
+    failure_class:policy.failureClass,transient:policy.transient,max_attempts:policy.maxAttempts,
+    retry_after_minutes:policy.retry?policy.delayMinutes:null,error:msg
+   },policy.blocked?424:500);
+  }
+ }catch(e){
+  console.error(e);
+  return out({ok:false,error:String(e)},500);
+ }
+});
