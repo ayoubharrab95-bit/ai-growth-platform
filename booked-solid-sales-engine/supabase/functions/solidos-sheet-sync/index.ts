@@ -299,7 +299,7 @@ async function coreSync(token:string){
     fetchAllBooked("outreach_queue","*","created_at",false),
     fetchAllBooked("runtime_settings","*"),
     fetchAllBooked("work_queue","id,status,kind,available_at,locked_at,attempts,last_error,updated_at"),
-    fetchAllBooked("source_catalog","slug,enabled,consecutive_errors,metadata"),
+    fetchAllBooked("source_catalog","slug,enabled,lifecycle_state,consecutive_errors,metadata"),
     fetchAllBooked("search_strategies","id,enabled,lifecycle_state")
   ]);
 
@@ -332,7 +332,9 @@ async function coreSync(token:string){
   const candidates=leads.filter((l:any)=>String(l.status).toLowerCase()==="candidate").sort(sortLeads);
   const ready=qualified.filter((l:any)=>String(contactResolution(l).state||"")==="ready");
   const contactForms=qualified.filter((l:any)=>String(contactResolution(l).state||"")==="contact_form_available");
-  const phoneOnly=qualified.filter((l:any)=>String(contactResolution(l).state||"")==="phone_available");
+  const phoneOnly=qualified.filter((l:any)=>["phone_available","phone_ready"].includes(String(contactResolution(l).state||"")));
+  const routedCount=ready.length+contactForms.length+phoneOnly.length;
+  const needsRoute=Math.max(0,qualified.length-routedCount);
   const namedDM=qualified.filter((l:any)=>!!contactResolution(l).decision_maker_known).length;
   const emailContacts=contacts.filter((c:any)=>!!c.email).length;
   const phoneContacts=contacts.filter((c:any)=>!!c.phone).length;
@@ -350,24 +352,28 @@ async function coreSync(token:string){
   const failedHistory=work.filter((q:any)=>q.status==="failed").length;
   const staleRunning=work.filter((q:any)=>q.status==="running"&&q.locked_at&&Date.parse(q.locked_at)<Date.now()-5*60*1000).length;
   const pendingByKind=(kind:string)=>work.filter((q:any)=>q.status==="pending"&&q.kind===kind).length;
+  const runningByKind=(kind:string)=>work.filter((q:any)=>q.status==="running"&&q.kind===kind).length;
+  const resolveBacklog=pendingByKind("resolve")+runningByKind("resolve");
 
   const enabledSources=sourceRows.filter((s:any)=>s.enabled).length;
-  const coolingSources=sourceRows.filter((s:any)=>s.enabled&&s.metadata?.cooldown_until&&Date.parse(s.metadata.cooldown_until)>Date.now()).length;
-  const degradedSources=sourceRows.filter((s:any)=>s.enabled&&(Number(s.consecutive_errors||0)>=4||String(s.metadata?.state||"")==="degraded")).length;
+  const isCooling=(s:any)=>!!(s.enabled&&s.metadata?.cooldown_until&&Date.parse(s.metadata.cooldown_until)>Date.now());
+  const coolingSources=sourceRows.filter((s:any)=>isCooling(s)).length;
+  const degradedSources=sourceRows.filter((s:any)=>s.enabled&&!isCooling(s)&&(String(s.lifecycle_state||"")==="degraded"||String(s.metadata?.state||"")==="degraded")).length;
   const enabledStrategies=strategyRows.filter((s:any)=>s.enabled&&["active","testing"].includes(String(s.lifecycle_state||"active"))).length;
-  const backpressure=dueNow>60||runningWork>20;
+  const backpressure=dueNow>60||runningWork>20||resolveBacklog>250;
 
   const actionFor=(l:any)=>{
     const cr=contactResolution(l), state=String(cr.state||"");
     if(state==="ready")return "READY";
     if(state==="contact_form_available")return "CONTACT FORM";
+    if(state==="phone_ready")return "PHONE READY";
     if(state==="phone_available")return "PHONE ONLY";
     if(cr.recipient_email)return "REVIEW EMAIL";
     return "FIND EMAIL";
   };
   const routeLabel=(l:any)=>{
     const s=String(contactResolution(l).state||"");
-    return s==="ready"?"Email Ready":s==="contact_form_available"?"Contact Form":s==="phone_available"?"Phone Only":"Needs Contact";
+    return s==="ready"?"Email Ready":s==="contact_form_available"?"Contact Form":s==="phone_ready"?"Phone Ready":s==="phone_available"?"Phone Only":"Needs Contact";
   };
   const contactValue=(l:any,key:string)=>{
     const cr=contactResolution(l), bc=bestContactByCompany.get(l.company_id)||{};
@@ -379,13 +385,13 @@ async function coreSync(token:string){
   const readyIds=new Set(ready.map((l:any)=>l.id));
   const msgCount=new Map<string,number>();
   for(const m of messages){
-    if(!["suppressed","failed"].includes(String(m.status||"").toLowerCase()))msgCount.set(m.lead_id,(msgCount.get(m.lead_id)||0)+1);
+    if(!["suppressed","failed","cancelled"].includes(String(m.status||"").toLowerCase()))msgCount.set(m.lead_id,(msgCount.get(m.lead_id)||0)+1);
   }
-  const readyMessages=messages.filter((m:any)=>readyIds.has(m.lead_id)&&!["suppressed","failed"].includes(String(m.status||"").toLowerCase())).length;
+  const readyMessages=messages.filter((m:any)=>readyIds.has(m.lead_id)&&!["suppressed","failed","cancelled"].includes(String(m.status||"").toLowerCase())).length;
   const badMsg=Array.from(readyIds).filter((leadId:any)=>(msgCount.get(leadId)||0)!==5).length;
   const nonQualActive=messages.filter((m:any)=>{
     const l=leadById.get(m.lead_id);
-    return l&&String(l.status).toLowerCase()!=="qualified"&&!["suppressed","failed"].includes(String(m.status||"").toLowerCase());
+    return l&&String(l.status).toLowerCase()!=="qualified"&&!["suppressed","failed","cancelled"].includes(String(m.status||"").toLowerCase());
   }).length;
   const smsBad=contacts.filter((c:any)=>c.sms_eligible&&String(c.sms_consent_status||"").toLowerCase()!=="granted").length;
   const seen=new Set<string>(),dups=new Set<string>();
@@ -403,7 +409,7 @@ async function coreSync(token:string){
     ["Snapshot",nowIso,"Search",settings.search_enabled?"ON":"OFF","Email",settings.email_enabled?"ON":"OFF","SMS",settings.sms_enabled?"ON":"OFF"],
     ["Companies",companies.length,"Leads",leads.length,"Qualified",qualified.length,"Candidates",candidates.length],
     ["Contacts",contacts.length,"Email Contacts",emailContacts,"Phone Contacts",phoneContacts,"Evidence",evidence.length],
-    ["Ready Email Leads",ready.length,"Ready Messages",readyMessages,"Named Decision Makers",namedDM,"Needs Contact Work",qualified.length-ready.length],
+    ["Ready Email Leads",ready.length,"Ready Messages",readyMessages,"Named Decision Makers",namedDM,"Needs Route",needsRoute],
     ["Last Sync",nowIso,"Writer","SolidOS Native","Backpressure",backpressure?"ON":"OFF","Warnings",warningCount],
     ["PRIORITY DISTRIBUTION","","","","","","",""],
     ["HOT",priCounts.hot||0,"HIGH",priCounts.high||0,"SIGNAL",priCounts.signal||0,"STANDARD",priCounts.standard||0],
@@ -417,8 +423,8 @@ async function coreSync(token:string){
     ["SYSTEM HEALTH & SAFETY","","","","","","",""],
     ["SOURCES ENABLED",enabledSources,"COOLING",coolingSources,"DEGRADED",degradedSources,"STRATEGIES ON",enabledStrategies],
     ["SEARCH",settings.search_enabled?"ON":"OFF","EMAIL",settings.email_enabled?"ON":"OFF","SMS",settings.sms_enabled?"ON":"OFF","BUYER OUTREACH","OFF"],
-    ["BACKPRESSURE",backpressure?"ON":"OFF","BLOCKED WORK",blockedWork,"STALE RUNNING",staleRunning,"DQ WARNINGS",warningCount],
-    ["SYNC", "Every ~2 min","ACTION QUEUE",qualified.length,"READY",ready.length,"NEEDS WORK",qualified.length-ready.length],
+    ["BACKPRESSURE",backpressure?"ON":"OFF","RESOLVE BACKLOG",resolveBacklog,"STALE RUNNING",staleRunning,"DQ WARNINGS",warningCount],
+    ["SYNC","Change-driven + hourly","ACTION QUEUE",qualified.length,"ROUTED",routedCount,"NEEDS ROUTE",needsRoute],
     ["","","","","","","",""],
     ["LEGEND","","","","","","",""],
     ["HOT","Highest priority","HIGH","Strong priority","SIGNAL","Signal-led","STANDARD","Normal"],
@@ -450,12 +456,12 @@ async function coreSync(token:string){
     ...Array.from(tradeMap.entries()).sort((a:any,b:any)=>b[1].q-a[1].q).map(([t,x]:any)=>[t,x.q,x.c,x.r,x.n?Math.round((x.sum/x.n)*10)/10:0,x.max])];
 
   // User-facing columns first. Stable IDs stay at the end and are hidden in the workbook.
-  const q360=[["Company","Priority","Opportunity","Trade","Decision Maker","Role","Email","Phone","Route","Contact Class","Why Now","Offer","Website","Verified Location","State","Search Market","Lead ID","Company ID"],
+  const q360=[["Company","Priority","Opportunity","Trade","Decision Maker","Role","Email","Phone","Route","Contact Form","Why Now","Offer","Website","Verified Location","State","Search Market","Lead ID","Company ID"],
     ...qualified.map((l:any)=>{
       const c=companyById.get(l.company_id)||{},cr=contactResolution(l);
       return [c.name||"",fmtPri(l.priority_band),Number(l.opportunity_score)||0,c.trade||"",
         cr.decision_maker_name||cr.recipient_name||"",cr.decision_maker_role||cr.recipient_role||"",
-        contactValue(l,"email"),contactValue(l,"phone"),routeLabel(l),cr.contact_class||"",l.why_now||"",
+        contactValue(l,"email"),contactValue(l,"phone"),routeLabel(l),cr.contact_form_url||"",l.why_now||"",
         l.offer||c.recommended_offer||"",c.website_url||"",c.location_text||"",c.state||"",searchMarket(c),l.id,l.company_id];
     })];
 
@@ -536,7 +542,7 @@ async function coreSync(token:string){
     ["Companies",companies.length],["Leads",leads.length],["Qualified",qualified.length],["Candidates",candidates.length],
     ["Email Ready",ready.length],["Contact Form Routes",contactForms.length],["Phone Only Routes",phoneOnly.length],["Named Decision Makers",namedDM],
     ["Contacts",contacts.length],["Evidence",evidence.length],["Due Work",dueNow],["Running Work",runningWork],["Future Work",futureWork],
-    ["Failed History",failedHistory],["Blocked Work",blockedWork],["Stale Running",staleRunning],["Backpressure",backpressure?"ON":"OFF"],
+    ["Failed History",failedHistory],["Blocked Work",blockedWork],["Resolve Backlog",resolveBacklog],["Stale Running",staleRunning],["Backpressure",backpressure?"ON":"OFF"],
     ["Sources Enabled",enabledSources],["Sources Cooling",coolingSources],["Sources Degraded",degradedSources],["Strategies Enabled",enabledStrategies],
     ["Data Quality",warningCount===0?"PASS":"WARNING"],["Warnings",warningCount]
   ];
