@@ -750,6 +750,14 @@ async function deferResolveJob(job:any,c:any,reason:string,resumeAt:string,extra
  return {resolved:false,reason,retry_scheduled:!(already??[]).length,resume_at:resumeAt,...extra};
 }
 
+async function queueQualifyFallback(job:any,c:any,reason:string){
+ const {data:q}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","qualify").in("status",["pending","running","done"]).contains("payload",{company_id:c.id}).limit(1);
+ if(!(q??[]).length){
+  await db.schema("booked_solid").from("work_queue").insert({kind:"qualify",priority:Math.max(45,Number(job.priority||50)),payload:{company_id:c.id,strategy_id:job.payload.strategy_id,reason:"resolution_fallback:"+reason},status:"pending",available_at:new Date().toISOString()});
+  return true;
+ }
+ return false;
+}
 async function resolveCompany(job:any){
  const id=job.payload.company_id;const {data:c,error}=await db.schema("booked_solid").from("companies").select("*").eq("id",id).single();if(error)throw error;
  if(c.status==="rejected"&&c.metadata?.duplicate_of)return {resolved:false,reason:"already_marked_duplicate",duplicate_of:c.metadata.duplicate_of};
@@ -776,7 +784,7 @@ async function resolveCompany(job:any){
  else{
   if((!Number.isFinite(lat)||!Number.isFinite(lon))&&!usefulResolutionLocation(locText)){
    await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"insufficient_location",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
-   return {resolved:false,reason:"insufficient_location_for_resolution"};
+   return {resolved:false,reason:"insufficient_location_for_resolution",qualification_fallback:await queueQualifyFallback(job,c,"insufficient_location")};
   }
   if(osmCooling){
    const resumeAt=new Date(Math.max(Date.now()+5*60000,osmCooldownMs+60000)).toISOString();
@@ -798,7 +806,7 @@ async function resolveCompany(job:any){
     if(cachedGeo.website){directWebsite=cachedGeo.website;resolutionMethod="nominatim_extratag_website";resolutionConfidence=88;hit={url:directWebsite,title:c.name};}
    }else{
     await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"geocoder_no_match",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
-    return {resolved:false,reason:"geocoder_no_match"};
+    return {resolved:false,reason:"geocoder_no_match",qualification_fallback:await queueQualifyFallback(job,c,"geocoder_no_match")};
    }
   }
 
@@ -809,13 +817,13 @@ async function resolveCompany(job:any){
     hit=osm.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));
     if(hit){resolutionMethod="openstreetmap_overpass";resolutionConfidence=88;}
    }catch(e){overpassError=e instanceof Error?e.message:String(e);}
-   if(!hit&&overpassError)throw new Error("overpass_fallback_failed:"+overpassError);
+   if(!hit&&overpassError){ await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"overpass_unavailable",preflight_last_attempt_at:new Date().toISOString(),preflight_last_error:overpassError}}).eq("id",id); return {resolved:false,reason:"overpass_unavailable",qualification_fallback:await queueQualifyFallback(job,c,"overpass_unavailable")}; }
   }
  }
 
  if(!hit){
   await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"unresolved",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
-  return {resolved:false,reason:"no_verified_website_match"};
+  return {resolved:false,reason:"no_verified_website_match",qualification_fallback:await queueQualifyFallback(job,c,"no_verified_website_match")};
  }
  const domain=domainOf(hit.url);if(!domain)return {resolved:false,reason:"no_domain"};
  const {data:dupe}=await db.schema("booked_solid").from("companies").select("*").eq("canonical_domain",domain).neq("id",id).maybeSingle();
@@ -1253,7 +1261,7 @@ async function contactResolve(job:any){
    await db.schema("booked_solid").from("outreach_queue").update({status:"cancelled",failure_reason:weakOnly?"Contact resolution: only weak-function inboxes available.":"Contact resolution: no usable email found."}).eq("lead_id",lead.id).in("status",["blocked_email_not_configured","ready"]);
    if(nextRetryAt){
     const {data:futureRetry}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","contact").eq("status","pending").contains("payload",{lead_id:lead.id}).limit(1);
-    if(!(futureRetry??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:Math.max(30,Number(lead.score||0)-15),payload:{lead_id:lead.id,company_id:company.id,contact_retry:retryCount+1,reason:"scheduled_contact_retry"},status:"pending",available_at:nextRetryAt});
+    if(!(futureRetry??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:Math.max(30,Number(lead.score||0)-15),payload:{lead_id:lead.id,company_id:company.id,contact_retry:retryCount+1,reason:"scheduled_contact_retry",force_contact_intelligence_v2:true},status:"pending",available_at:nextRetryAt});
    }
    return {lead_id:lead.id,company:company.name,...resolution,queued_message:false,retry_scheduled:Boolean(nextRetryAt)};
  }
@@ -1360,13 +1368,17 @@ function runtimeFailurePolicy(msg:string,attempts:number){
 Deno.serve(async req=>{
  try{
   if(req.method==="OPTIONS")return new Response("ok",{headers:H});
-  await db.schema("booked_solid").from("work_queue").update({status:"pending",locked_at:null,locked_by:null,available_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("status","running").lt("locked_at",new Date(Date.now()-15*60000).toISOString());
-  const {data:jobs,error}=await db.rpc("claim_booked_solid_work",{p_worker:"booked-solid-"+crypto.randomUUID()});
-  if(error)throw error;
-  const job=jobs?.[0];
-  if(!job)return out({ok:true,idle:true});
-  let result:any;
-  try{
+  await db.schema("booked_solid").from("work_queue").update({status:"pending",locked_at:null,locked_by:null,available_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("status","running").lt("locked_at",new Date(Date.now()-5*60000).toISOString());
+  const requestBody=await req.clone().json().catch(()=>({}));
+  const batchSize=Math.max(1,Math.min(8,Number(requestBody.batch_size||4)));
+  const results:any[]=[];
+  for(let batchIndex=0;batchIndex<batchSize;batchIndex++){
+   const {data:jobs,error}=await db.rpc("claim_booked_solid_work",{p_worker:"booked-solid-"+crypto.randomUUID()});
+   if(error)throw error;
+   const job=jobs?.[0];
+   if(!job)break;
+   let result:any;
+   try{
    if(job.kind==="discover")result=await discover(job);
    else if(job.kind==="research")result=await research(job);
    else if(job.kind==="location")result=await locationEnrich(job);
@@ -1376,7 +1388,7 @@ Deno.serve(async req=>{
    else if(job.kind==="resolve")result=await resolveCompany(job);
    else result={skipped:job.kind};
    await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,updated_at:new Date().toISOString()}).eq("id",job.id);
-   return out({ok:true,job_id:job.id,kind:job.kind,result});
+   results.push({ok:true,job_id:job.id,kind:job.kind,result});
   }catch(e){
    const msg=e instanceof Error?e.message:(e&&typeof e==="object"?JSON.stringify(e):String(e));
    const policy=runtimeFailurePolicy(msg,Number(job.attempts??0));
@@ -1392,12 +1404,12 @@ Deno.serve(async req=>{
     available_at:new Date(Date.now()+policy.delayMinutes*60000).toISOString(),
     locked_at:null,locked_by:null,updated_at:new Date().toISOString()
    }).eq("id",job.id);
-   return out({
-    ok:false,job_id:job.id,kind:job.kind,blocked:policy.blocked,retry:policy.retry,
+   results.push({ok:false,job_id:job.id,kind:job.kind,blocked:policy.blocked,retry:policy.retry,
     failure_class:policy.failureClass,transient:policy.transient,max_attempts:policy.maxAttempts,
-    retry_after_minutes:policy.retry?policy.delayMinutes:null,error:msg
-   },policy.blocked?424:500);
+    retry_after_minutes:policy.retry?policy.delayMinutes:null,error:msg});
+   }
   }
+  return out({ok:true,batch_size:batchSize,processed:results.length,idle:results.length===0,results});
  }catch(e){
   console.error(e);
   return out({ok:false,error:String(e)},500);
