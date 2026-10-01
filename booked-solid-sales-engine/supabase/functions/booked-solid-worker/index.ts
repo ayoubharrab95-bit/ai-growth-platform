@@ -208,6 +208,78 @@ async function searchOSM(trade:string,location:string,latArg?:number,lonArg?:num
 
 function coreTokens(s:string){const stop=new Set(["the","and","inc","llc","corp","corporation","company","co","contractor","contractors","construction","services","service","group","roofing","plumbing","electrical","electric","hvac","mechanical","remodeling","builders","builder"]);return normalize(s).split(" ").filter(x=>x.length>=3&&!stop.has(x));}
 function namesMatch(a:string,b:string){const na=normalize(a),nb=normalize(b);if(!na||!nb)return false;if(na.includes(nb)||nb.includes(na))return true;const A=coreTokens(a),B=coreTokens(b);if(!A.length||!B.length)return false;const hits=A.filter(x=>B.includes(x)).length;return hits>=Math.min(2,Math.min(A.length,B.length));}
+const FREE_EMAIL_DOMAINS=new Set(["gmail.com","googlemail.com","yahoo.com","ymail.com","outlook.com","hotmail.com","live.com","msn.com","aol.com","icloud.com","me.com","mac.com","proton.me","protonmail.com","gmx.com","mail.com","comcast.net","att.net","verizon.net","cox.net"]);
+function businessEmailDomain(email:string){
+ const parts=String(email||"").trim().toLowerCase().split("@");if(parts.length!==2)return null;
+ const d=parts[1].replace(/^www\./,"");if(!d||FREE_EMAIL_DOMAINS.has(d)||/\.(gov|edu)$/.test(d))return null;
+ if(/(^|\.)(socrata|arcgis|esri|salesforce|hubspot|mailchimp|constantcontact)\./.test(d))return null;
+ return d;
+}
+function strongDomainNameMatch(name:string,domain:string){
+ const stem=String(domain||"").split(".")[0].replace(/[^a-z0-9]/g,"");
+ const toks=coreTokens(name).filter((x:string)=>x.length>=4);
+ return toks.some((t:string)=>stem.includes(t));
+}
+async function verifiedWebsiteFromContactEmail(company:any){
+ try{
+  const {data:cts}=await db.schema("booked_solid").from("contacts").select("email").eq("company_id",company.id).not("email","is",null).in("status",["unverified","verified"]).limit(12);
+  const domains=[...new Set((cts??[]).map((x:any)=>businessEmailDomain(String(x.email||""))).filter(Boolean))] as string[];
+  for(const domain of domains.slice(0,3)){
+   for(const scheme of ["https://","http://"]){
+    try{
+     const r=await fetch(scheme+domain+"/",{redirect:"follow",signal:AbortSignal.timeout(5000),headers:{"User-Agent":"BookedSolidPreflightBot/2.0 (+https://www.bookedsolidcopy.com/)"}});
+     if(!r.ok)continue;
+     const raw=(await r.text()).slice(0,220000);
+     const title=clean((raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]??"")).slice(0,180);
+     const h1=clean((raw.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1]??"")).slice(0,180);
+     const visible=clean(raw).slice(0,9000);
+     if(/domain (?:is )?for sale|buy this domain|parked free|sedo parking/i.test(title+" "+visible.slice(0,1200)))continue;
+     const matched=namesMatch(String(company.name||""),title)||namesMatch(String(company.name||""),h1)||strongDomainNameMatch(String(company.name||""),domain);
+     if(!matched)continue;
+     const finalDomain=domainOf(r.url)||domain;
+     return {url:r.url||("https://"+finalDomain+"/"),domain:finalDomain,method:"verified_contact_email_domain",confidence:94,email_domain:domain,title:title||h1||null};
+    }catch{}
+   }
+  }
+ }catch{}
+ return null;
+}
+async function safeMergeResolvedDuplicate(source:any,target:any,domain:string,method:string){
+ let movedContacts=0,suppressedLeads=0;
+ const {data:sourceContacts}=await db.schema("booked_solid").from("contacts").select("*").eq("company_id",source.id);
+ for(const ct of sourceContacts??[]){
+  try{
+   if(ct.email){
+    const {data:existing}=await db.schema("booked_solid").from("contacts").select("*").eq("company_id",target.id).eq("email",ct.email).maybeSingle();
+    if(existing){
+     const patch:any={};
+     if(!existing.full_name&&ct.full_name)patch.full_name=ct.full_name;
+     if(!existing.role&&ct.role)patch.role=ct.role;
+     if(!existing.phone&&ct.phone){patch.phone=ct.phone;patch.phone_type=ct.phone_type;patch.phone_confidence=ct.phone_confidence;patch.phone_source_url=ct.phone_source_url;}
+     if(Object.keys(patch).length)await db.schema("booked_solid").from("contacts").update(patch).eq("id",existing.id);
+     continue;
+    }
+   }
+   const {error}=await db.schema("booked_solid").from("contacts").update({company_id:target.id}).eq("id",ct.id);
+   if(!error)movedContacts++;
+  }catch{}
+ }
+ await db.schema("booked_solid").from("evidence").update({company_id:target.id}).eq("company_id",source.id);
+ const {data:sourceLeads}=await db.schema("booked_solid").from("leads").select("id,status,lead_brief").eq("company_id",source.id);
+ for(const l of sourceLeads??[]){
+  if(l.status!=="suppressed"){
+   await db.schema("booked_solid").from("leads").update({status:"suppressed",lead_brief:{...(l.lead_brief??{}),duplicate_company_id:target.id,duplicate_domain:domain,duplicate_merge_version:2}}).eq("id",l.id);
+   suppressedLeads++;
+  }
+ }
+ await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:"cancelled_duplicate_company_v2",updated_at:new Date().toISOString()})
+   .eq("status","pending").contains("payload",{company_id:source.id});
+ await db.schema("booked_solid").from("companies").update({
+  status:"rejected",
+  metadata:{...(source.metadata??{}),needs_website_resolution:false,duplicate_of:target.id,duplicate_domain:domain,duplicate_resolution_method:method,identity_confidence:100,identity_status:"duplicate_confirmed",identity_version:2,duplicate_merged_at:new Date().toISOString()}
+ }).eq("id",source.id);
+ return {movedContacts,suppressedLeads};
+}
 async function searchWikidata(location:string,latArg?:number,lonArg?:number){
  const lat=Number(latArg),lon=Number(lonArg);if(!Number.isFinite(lat)||!Number.isFinite(lon))return {provider:"wikidata_sparql",results:[]};
  const q=`SELECT DISTINCT ?item ?itemLabel ?website WHERE {
@@ -528,60 +600,84 @@ async function resolveLocationWithNominatim(companyName:string,locationText:stri
 }
 async function resolveCompany(job:any){
  const id=job.payload.company_id;const {data:c,error}=await db.schema("booked_solid").from("companies").select("*").eq("id",id).single();if(error)throw error;
- if(c.website_url&&c.canonical_domain){await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+3,payload:{company_id:id,strategy_id:job.payload.strategy_id},status:"pending"});return {resolved:true,already:true};}
- let lat=job.payload.latitude,lon=job.payload.longitude;let directWebsite:string|null=null;let cachedGeo:any=null;
- if((lat==null||lon==null)&&String(job.payload.location_text||c.metadata?.source_market||"")){
-  cachedGeo=await resolveLocationWithNominatim(String(c.name||""),String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||""));
-  if(cachedGeo){lat=cachedGeo.lat;lon=cachedGeo.lon;directWebsite=cachedGeo.website;}
+ if(c.status==="rejected"&&c.metadata?.duplicate_of)return {resolved:false,reason:"already_marked_duplicate",duplicate_of:c.metadata.duplicate_of};
+ if(c.website_url&&c.canonical_domain){
+  const {data:rq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","research").in("status",["pending","running"]).contains("payload",{company_id:id}).limit(1);
+  if(!(rq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+3,payload:{company_id:id,strategy_id:job.payload.strategy_id,reason:"preflight_existing_domain"},status:"pending"});
+  return {resolved:true,already:true};
  }
+
+ let lat=job.payload.latitude,lon=job.payload.longitude;let directWebsite:string|null=null;let cachedGeo:any=null;let resolutionMethod="unknown";let resolutionConfidence=0;let preflight:any=null;
+
+ // Fast Preflight v2: verified business-domain email first. This avoids OSM when official/public permit data already exposes a company-domain email.
+ const emailResolved=await verifiedWebsiteFromContactEmail(c);
+ if(emailResolved){
+  directWebsite=emailResolved.url;resolutionMethod=emailResolved.method;resolutionConfidence=emailResolved.confidence;preflight=emailResolved;
+ }
+
+ if(!directWebsite&&(lat==null||lon==null)&&String(job.payload.location_text||c.metadata?.source_market||"")){
+  cachedGeo=await resolveLocationWithNominatim(String(c.name||""),String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||""));
+  if(cachedGeo){lat=cachedGeo.lat;lon=cachedGeo.lon;if(cachedGeo.website){directWebsite=cachedGeo.website;resolutionMethod="nominatim_extratag_website";resolutionConfidence=88;}}
+ }
+
  const {data:osmHealth}=await db.schema("booked_solid").from("source_catalog").select("enabled,lifecycle_state,metadata").eq("slug","openstreetmap_overpass").maybeSingle();
  const osmCooldownRaw=String(osmHealth?.metadata?.cooldown_until||"");
  const osmCooldownMs=osmCooldownRaw?new Date(osmCooldownRaw).getTime():0;
  const osmCooling=Number.isFinite(osmCooldownMs)&&osmCooldownMs>Date.now();
+
  if(osmCooling&&!directWebsite){
   const locText=String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||"");
   if(!cachedGeo&&locText)cachedGeo=await resolveLocationWithNominatim(String(c.name||""),locText);
-  if(cachedGeo?.website)directWebsite=cachedGeo.website;
+  if(cachedGeo?.website){directWebsite=cachedGeo.website;resolutionMethod="nominatim_extratag_website";resolutionConfidence=88;}
   else{
    const resumeAt=new Date(Math.max(Date.now()+5*60000,osmCooldownMs+60000)).toISOString();
    const {data:already}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","resolve").eq("status","pending").contains("payload",{company_id:id}).limit(1);
    if(!(already??[]).length){
-    await db.schema("booked_solid").from("work_queue").insert({
-     kind:"resolve",priority:Number(job.priority||50),
-     payload:{...job.payload,deferred_reason:"openstreetmap_cooldown"},
-     status:"pending",available_at:resumeAt
-    });
+    await db.schema("booked_solid").from("work_queue").insert({kind:"resolve",priority:Number(job.priority||50),payload:{...job.payload,deferred_reason:"openstreetmap_cooldown"},status:"pending",available_at:resumeAt});
    }
+   await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"deferred_source_cooldown",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
    return {resolved:false,reason:"openstreetmap_cooling_deferred",retry_scheduled:!(already??[]).length,resume_at:resumeAt,cooldown_until:osmCooldownRaw};
   }
  }
+
  let hit:any=null;
  if(directWebsite){hit={url:directWebsite,title:c.name};}
  else{
   let overpassError:string|null=null;
-  try{const osm=await searchOSM(job.payload.trade||c.trade||"Mixed",job.payload.geography||"US",lat,lon);hit=osm.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));}catch(e){overpassError=e instanceof Error?e.message:String(e)}
+  try{const osm=await searchOSM(job.payload.trade||c.trade||"Mixed",job.payload.geography||"US",lat,lon);hit=osm.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));if(hit){resolutionMethod="openstreetmap_overpass";resolutionConfidence=88;}}catch(e){overpassError=e instanceof Error?e.message:String(e)}
   if(!hit&&String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||"")){
    const geo=cachedGeo??await resolveLocationWithNominatim(String(c.name||""),String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||""));
-   if(geo?.website)hit={url:geo.website,title:c.name};
-   else if(geo && !overpassError){
+   if(geo?.website){hit={url:geo.website,title:c.name};resolutionMethod="nominatim_extratag_website";resolutionConfidence=88;}
+   else if(geo&&!overpassError){
     const osm2=await searchOSM(job.payload.trade||c.trade||"Mixed",String(job.payload.location_text||job.payload.geography||"US"),geo.lat,geo.lon);
-    hit=osm2.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));
+    hit=osm2.results.find((x:any)=>namesMatch(String(c.name||""),String(x.title||"")));if(hit){resolutionMethod="openstreetmap_overpass_near_nominatim";resolutionConfidence=86;}
    }
   }
   if(!hit&&overpassError)throw new Error("overpass_fallback_failed:"+overpassError);
  }
- if(!hit)return {resolved:false,reason:"no_osm_or_nominatim_match"};
- const domain=domainOf(hit.url);if(!domain)return {resolved:false,reason:"no_domain"};
- const {data:dupe}=await db.schema("booked_solid").from("companies").select("id").eq("canonical_domain",domain).neq("id",id).maybeSingle();
- if(dupe){
-  await db.schema("booked_solid").from("evidence").update({company_id:dupe.id}).eq("company_id",id);
-  await db.schema("booked_solid").from("companies").delete().eq("id",id);
-  await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+3,payload:{company_id:dupe.id,strategy_id:job.payload.strategy_id},status:"pending"});
-  return {resolved:true,merged_into:dupe.id,domain};
+
+ if(!hit){
+  await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"unresolved",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
+  return {resolved:false,reason:"no_verified_website_match"};
  }
- await db.schema("booked_solid").from("companies").update({canonical_domain:domain,website_url:"https://"+domain+"/",source_last_seen:"openstreetmap_overpass",metadata:{...(c.metadata??{}),needs_website_resolution:false,resolved_via:"openstreetmap_overpass"}}).eq("id",id);
- await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+3,payload:{company_id:id,strategy_id:job.payload.strategy_id},status:"pending"});
- return {resolved:true,domain};
+
+ const domain=domainOf(hit.url);if(!domain)return {resolved:false,reason:"no_domain"};
+ const {data:dupe}=await db.schema("booked_solid").from("companies").select("*").eq("canonical_domain",domain).neq("id",id).maybeSingle();
+ if(dupe){
+  const merged=await safeMergeResolvedDuplicate(c,dupe,domain,resolutionMethod);
+  const {data:rq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","research").in("status",["pending","running"]).contains("payload",{company_id:dupe.id}).limit(1);
+  if(!(rq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+3,payload:{company_id:dupe.id,strategy_id:job.payload.strategy_id,reason:"identity_merge_v2"},status:"pending"});
+  return {resolved:true,merged_into:dupe.id,domain,resolution_method:resolutionMethod,merge:merged};
+ }
+
+ const preflightScore=Math.min(100,40+(resolutionConfidence>=90?25:18)+(c.state?10:0)+(c.trade?10:0)+(preflight?.email_domain?15:0));
+ await db.schema("booked_solid").from("companies").update({
+  canonical_domain:domain,website_url:"https://"+domain+"/",
+  metadata:{...(c.metadata??{}),needs_website_resolution:false,resolved_via:resolutionMethod,resolution_confidence:resolutionConfidence,preflight_version:2,preflight_status:"passed",preflight_score:preflightScore,preflight_last_attempt_at:new Date().toISOString(),identity_version:2,identity_status:"domain_verified",identity_confidence:resolutionConfidence,verified_email_domain:preflight?.email_domain??null}
+ }).eq("id",id);
+ const {data:rq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","research").in("status",["pending","running"]).contains("payload",{company_id:id}).limit(1);
+ if(!(rq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+(resolutionMethod==="verified_contact_email_domain"?5:3),payload:{company_id:id,strategy_id:job.payload.strategy_id,reason:"preflight_v2",resolution_method:resolutionMethod},status:"pending"});
+ return {resolved:true,domain,resolution_method:resolutionMethod,resolution_confidence:resolutionConfidence,preflight_score:preflightScore};
 }
 async function discover(job:any){
  const p=job.payload;const q=String(p.query_template??"").replace("{trade}",p.trade??"Mixed").replace("{location}",p.geography==="US"?"United States":String(p.geography??"US"));let sr:any;
@@ -597,10 +693,30 @@ async function discover(job:any){
  else if(sourceDef?.metadata?.adapter==="generic_arcgis")sr=await searchGenericArcGIS(sourceDef,p.trade??"Mixed");
  else sr=await search(q);let n=0;
  for(const item of sr.results){if(n>=5)break;const itemName=String(item.title??"").trim();const domain=domainOf(item.url??"");const sourceLoc=locationFromMeta(item.meta??{},sr.provider,item.meta?.source_url??item.url,Number(item.meta?.evidence_confidence??(sr.provider==="openstreetmap_overpass"?88:90)));if(!domain&&item.meta?.needs_website_resolution){
-   if(itemName.length<3)continue;const nn=normalize(itemName);let c:any;const {data:existingByName}=await db.schema("booked_solid").from("companies").select("*").eq("normalized_name",nn).limit(1).maybeSingle();
+   if(itemName.length<3)continue;const nn=normalize(itemName);let c:any;let existingByName:any=null;let identityMethod:string|null=null;
+   const sourceState=String(sourceLoc?.state??item.meta?.state??"").trim().toUpperCase();
+   const sourceLocation=normalize(String(sourceLoc?.location_text??""));
+   if(item.meta?.email){
+    const em=String(item.meta.email).trim().toLowerCase();
+    const {data:emailHits}=await db.schema("booked_solid").from("contacts").select("company_id").eq("email",em).limit(2);
+    if((emailHits??[]).length===1){
+     const {data:emailCompany}=await db.schema("booked_solid").from("companies").select("*").eq("id",emailHits![0].company_id).maybeSingle();
+     if(emailCompany){existingByName=emailCompany;identityMethod="exact_public_email";}
+    }
+   }
+   if(!existingByName){
+    const {data:nameHits}=await db.schema("booked_solid").from("companies").select("*").eq("normalized_name",nn).limit(8);
+    existingByName=(nameHits??[]).find((x:any)=>{
+     const xs=String(x.state??"").trim().toUpperCase();
+     if(sourceState&&xs)return sourceState===xs;
+     const xl=normalize(String(x.location_text??""));
+     return Boolean(sourceLocation&&xl&&sourceLocation===xl);
+    })??null;
+    if(existingByName)identityMethod=sourceState&&String(existingByName.state??"").trim().toUpperCase()===sourceState?"name_plus_state":"name_plus_location";
+   }
    if(existingByName){
-    if(sourceLoc&&(!existingByName.location_text||!existingByName.state)){const patch:any={metadata:{...(existingByName.metadata??{}),location_provenance:existingByName.metadata?.location_provenance??sourceLoc.provenance}};if(!existingByName.location_text)patch.location_text=sourceLoc.location_text;if(!existingByName.state&&sourceLoc.state)patch.state=sourceLoc.state;if(!existingByName.country&&sourceLoc.country)patch.country=sourceLoc.country;const {data:u,error:ue}=await db.schema("booked_solid").from("companies").update(patch).eq("id",existingByName.id).select("*").single();if(ue)throw ue;c=u;}else c=existingByName;
-   }else{const inferredTrade=item.meta?.trade_hint??(item.meta?.source_trade_independent?null:(p.trade==="Mixed"?null:p.trade));const {data:i,error:ie}=await db.schema("booked_solid").from("companies").insert({canonical_domain:null,normalized_name:nn,name:itemName,trade:inferredTrade,website_url:null,source_first_seen:sr.provider,source_last_seen:sr.provider,status:"discovered",location_text:sourceLoc?.location_text??null,state:sourceLoc?.state??null,country:sourceLoc?.country??"US",metadata:{query:q,search_market:p.geography,needs_website_resolution:true,geography:p.geography,permit_trade_hint:item.meta?.trade_hint??null,source_market:item.meta?.city||item.meta?.state?([item.meta?.city,item.meta?.state].filter(Boolean).join(" ")):null,...(sourceLoc?{location_provenance:sourceLoc.provenance}:{})}}).select("*").single();if(ie)throw ie;c=i;}
+    if(sourceLoc&&(!existingByName.location_text||!existingByName.state)){const patch:any={metadata:{...(existingByName.metadata??{}),identity_version:2,identity_status:"matched_existing",identity_method:identityMethod,identity_confidence:identityMethod==="exact_public_email"?98:92,identity_last_seen_at:new Date().toISOString(),location_provenance:existingByName.metadata?.location_provenance??sourceLoc.provenance}};if(!existingByName.location_text)patch.location_text=sourceLoc.location_text;if(!existingByName.state&&sourceLoc.state)patch.state=sourceLoc.state;if(!existingByName.country&&sourceLoc.country)patch.country=sourceLoc.country;const {data:u,error:ue}=await db.schema("booked_solid").from("companies").update(patch).eq("id",existingByName.id).select("*").single();if(ue)throw ue;c=u;}else c=existingByName;
+   }else{const inferredTrade=item.meta?.trade_hint??(item.meta?.source_trade_independent?null:(p.trade==="Mixed"?null:p.trade));const {data:i,error:ie}=await db.schema("booked_solid").from("companies").insert({canonical_domain:null,normalized_name:nn,name:itemName,trade:inferredTrade,website_url:null,source_first_seen:sr.provider,source_last_seen:sr.provider,status:"discovered",location_text:sourceLoc?.location_text??null,state:sourceLoc?.state??null,country:sourceLoc?.country??"US",metadata:{query:q,search_market:p.geography,needs_website_resolution:true,geography:p.geography,permit_trade_hint:item.meta?.trade_hint??null,source_market:item.meta?.city||item.meta?.state?([item.meta?.city,item.meta?.state].filter(Boolean).join(" ")):null,identity_version:2,identity_status:"new_unresolved",identity_key:nn+"|"+(sourceState||normalize(String(sourceLoc?.location_text??p.geography??""))),preflight_version:2,preflight_status:"needs_resolution",...(sourceLoc?{location_provenance:sourceLoc.provenance}:{})}}).select("*").single();if(ie)throw ie;c=i;}
    const et=item.meta?.evidence_type??"permit_activity";const conf=Number(item.meta?.evidence_confidence??90);const {error:pe}=await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:et,claim:item.description??(et==="trade_license"?"Active official trade license":"Recent official permit activity"),snippet:item.description??null,source_url:item.meta?.source_url??permitSourceUrl(sr.provider),confidence:conf,metadata:{provider:sr.provider,query:q,...(item.meta??{})}});if(pe)throw pe;
    if(item.meta?.email){
     const em=String(item.meta.email).toLowerCase();const {data:ec}=await db.schema("booked_solid").from("contacts").select("id").eq("company_id",c.id).eq("email",em).maybeSingle();
