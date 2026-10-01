@@ -311,7 +311,7 @@ async function coreSync(token:string){
   }
   const nowIso=new Date().toISOString();
 
-  const [companies,leads,contacts,evidence,messages,settingsRows,work,sourceRows,strategyRows,priorityYieldRows,priorityEnrichmentRows]=await Promise.all([
+  const [companies,leads,contacts,evidence,messages,settingsRows,work,sourceRows,strategyRows,priorityYieldRows,priorityEnrichmentRows,sourceLeadYieldRows]=await Promise.all([
     fetchAllBooked("companies","*","updated_at",false),
     fetchAllBooked("leads","*","opportunity_score",false),
     fetchAllBooked("contacts","*","updated_at",false),
@@ -322,7 +322,8 @@ async function coreSync(token:string){
     fetchAllBooked("source_catalog","slug,enabled,lifecycle_state,consecutive_errors,metadata"),
     fetchAllBooked("search_strategies","id,enabled,lifecycle_state"),
     fetchAllBooked("priority_yield_snapshot","*","yield_score",false),
-    fetchAllBooked("priority_enrichment_log","*","updated_at",false)
+    fetchAllBooked("priority_enrichment_log","*","updated_at",false),
+    fetchAllBooked("source_lead_yield_snapshot","*","yield_score",false)
   ]);
 
   const settings=settingsRows?.[0]||{};
@@ -577,6 +578,16 @@ async function coreSync(token:string){
       x.dimension_type||"",x.dimension_key||"",Number(x.sample_count)||0,Number(x.hot_count)||0,Number(x.high_count)||0,
       Number(x.signal_count)||0,Number(x.standard_count)||0,
       Number(x.hot_high_yield||0),Number(x.yield_score||0),Number(x.avg_opportunity||0),Number(x.avg_trigger||0)
+    ]),
+    ["","","","","","","","","","",""],
+    ["SOURCE → LEAD YIELD","","","","","","","","","",""],
+    ["Source","Tier","Sample","Rejected","Leads","Qualified","HOT+HIGH","Lead Rate","Qualified Rate","Yield Score","Updated"],
+    ...[...sourceLeadYieldRows].sort((a:any,b:any)=>
+      Number(b.yield_score||0)-Number(a.yield_score||0) || Number(b.sample_count||0)-Number(a.sample_count||0)
+    ).slice(0,60).map((x:any)=>[
+      x.source_slug||"",String(x.discovery_tier||"").toUpperCase(),Number(x.sample_count)||0,Number(x.rejected_count)||0,
+      Number(x.lead_count)||0,Number(x.qualified_count)||0,Number(x.hot_high_count)||0,
+      Number(x.lead_rate||0),Number(x.qualified_rate||0),Number(x.yield_score||0),x.updated_at||""
     ]),
     ["","","","","","","","","","",""],
     ["RECENT NEAR-THRESHOLD ENRICHMENT","","","","","","","","","",""],
