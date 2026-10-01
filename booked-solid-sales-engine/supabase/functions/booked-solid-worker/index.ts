@@ -345,6 +345,84 @@ function strongDomainNameMatch(name:string,domain:string){
  const toks=coreTokens(name).filter((x:string)=>x.length>=4);
  return toks.some((t:string)=>stem.includes(t));
 }
+function domainGuessParts(name:string){
+ const legal=new Set(["inc","incorporated","llc","ltd","limited","corp","corporation","co","company","pllc","pc"]);
+ return String(name||"").split(/[\/|]/).map(x=>normalize(x)).filter(Boolean).map(part=>
+   part.split(" ").filter(t=>t&&!legal.has(t))
+ ).filter((x:any[])=>x.length);
+}
+function domainGuessCandidates(name:string){
+ const descriptor=new Set(["services","service","solutions","group","management","mgmt","contractor","contractors","contracting"]);
+ const trade=new Set(["roofing","roof","electric","electrical","plumbing","plumber","hvac","heating","mechanical","construction","remodeling","painting","landscaping","flooring","concrete"]);
+ const out:string[]=[];
+ const add=(stem:string)=>{
+   const s=stem.replace(/[^a-z0-9]/g,"");
+   if(s.length<5||s.length>42)return;
+   for(const tld of [".com",".net"]){const d=s+tld;if(!out.includes(d))out.push(d);}
+ };
+ for(const toks of domainGuessParts(name)){
+   add(toks.join(""));
+   if(toks.length>=3&&descriptor.has(toks[toks.length-1]))add(toks.slice(0,-1).join(""));
+   if(toks.length>=3)add(toks.slice(0,2).join(""));
+   const brand=toks.find(t=>!descriptor.has(t)&&!trade.has(t)&&t.length>=4);
+   const tradeTok=toks.find(t=>trade.has(t));
+   if(brand&&tradeTok)add(brand+tradeTok);
+   if(out.length>=6)break;
+ }
+ return out.slice(0,6);
+}
+function domainGuessBrandTokens(name:string){
+ const generic=new Set([
+  "inc","incorporated","llc","ltd","limited","corp","corporation","co","company","pllc","pc",
+  "services","service","solutions","group","management","mgmt","contractor","contractors","contracting",
+  "roofing","roof","electric","electrical","plumbing","plumber","hvac","heating","mechanical","construction",
+  "remodeling","painting","landscaping","flooring","concrete","home","commercial","residential"
+ ]);
+ return normalize(String(name||"")).split(" ").filter(t=>t.length>=3&&!generic.has(t));
+}
+async function verifiedWebsiteFromNameGuess(company:any,locText:string){
+ const candidates=domainGuessCandidates(String(company.name||""));
+ const brand=domainGuessBrandTokens(String(company.name||""));
+ const descriptors=normalize(String(company.name||"")).split(" ").filter(t=>
+   ["roofing","roof","electric","electrical","plumbing","plumber","hvac","heating","mechanical","construction","remodeling","painting","landscaping","flooring","concrete"].includes(t)
+ );
+ if(!candidates.length||!brand.length)return null;
+ const blocked=new Set(["godaddy.com","sedo.com","hugedomains.com","dan.com","afternic.com","namecheap.com","facebook.com","linkedin.com"]);
+ for(const domain of candidates){
+  try{
+   const rr=await fetch("https://"+domain+"/",{redirect:"follow",signal:AbortSignal.timeout(5000),headers:{"User-Agent":"BookedSolidPreflightBot/2.1 (+https://www.bookedsolidcopy.com/)"}});
+   if(!rr.ok)continue;
+   const finalDomain=domainOf(rr.url)||domain;
+   if([...blocked].some(d=>finalDomain===d||finalDomain.endsWith("."+d)))continue;
+   const raw=(await rr.text()).slice(0,240000);
+   const title=clean((raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]??"")).slice(0,200);
+   const h1=clean((raw.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1]??"")).slice(0,200);
+   const visible=clean(raw).slice(0,14000);
+   const hay=normalize(title+" "+h1+" "+visible);
+   if(/domain (?:is )?for sale|buy this domain|parked free|sedo parking|this domain may be for sale/i.test(title+" "+visible.slice(0,1800)))continue;
+   const hostStem=finalDomain.split(".")[0].replace(/[^a-z0-9]/g,"");
+   const brandHits=brand.filter(t=>hay.includes(t)).length;
+   const descriptorHit=descriptors.some(t=>hay.includes(t));
+   const hostBrand=brand.some(t=>t.length>=4&&hostStem.includes(t));
+   const exactish=namesMatch(String(company.name||""),title)||namesMatch(String(company.name||""),h1);
+   let matched=false;
+   if(exactish)matched=true;
+   else if(brand.length>=2&&brandHits>=Math.min(2,brand.length)&&hostBrand)matched=true;
+   else if(brand.length===1&&brand[0].length>=5&&brandHits>=1&&hostBrand&&(descriptorHit||descriptors.length===0))matched=true;
+   if(!matched)continue;
+   const marketTokens=normalize(String(locText||"")).split(" ").filter(t=>t.length>=4);
+   const marketHit=marketTokens.some(t=>hay.includes(t));
+   return {
+     url:rr.url||("https://"+finalDomain+"/"),
+     domain:finalDomain,
+     method:"verified_name_domain_guess",
+     confidence:exactish?84:(marketHit?80:76),
+     title:title||h1||null
+   };
+  }catch{}
+ }
+ return null;
+}
 async function verifiedWebsiteFromContactEmail(company:any){
  try{
   const {data:cts}=await db.schema("booked_solid").from("contacts").select("email").eq("company_id",company.id).not("email","is",null).in("status",["unverified","verified"]).limit(12);
@@ -811,16 +889,18 @@ async function resolveCompany(job:any){
  let hit:any=null;
  if(directWebsite)hit={url:directWebsite,title:c.name};
  else{
-  if((!Number.isFinite(lat)||!Number.isFinite(lon))&&!usefulResolutionLocation(locText)){
+  const guessed=await verifiedWebsiteFromNameGuess(c,locText);
+  if(guessed){hit=guessed;resolutionMethod=guessed.method;resolutionConfidence=guessed.confidence;preflight=guessed;}
+  if(!hit&&(!Number.isFinite(lat)||!Number.isFinite(lon))&&!usefulResolutionLocation(locText)){
    await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"insufficient_location",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
    return {resolved:false,reason:"insufficient_location_for_resolution",qualification_fallback:await queueQualifyFallback(job,c,"insufficient_location")};
   }
-  if(osmCooling){
+  if(!hit&&osmCooling){
    const resumeAt=new Date(Math.max(Date.now()+5*60000,osmCooldownMs+60000)).toISOString();
    return await deferResolveJob(job,c,"openstreetmap_cooldown",resumeAt,{cooldown_until:osmCooldownRaw});
   }
 
-  if(!Number.isFinite(lat)||!Number.isFinite(lon)){
+  if(!hit&&(!Number.isFinite(lat)||!Number.isFinite(lon))){
    if(geoCooling){
     const resumeAt=new Date(Math.max(Date.now()+5*60000,geoCooldownMs+60000)).toISOString();
     return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{cooldown_until:geoCooldownRaw});
@@ -878,6 +958,8 @@ async function resolveCompany(job:any){
 async function discover(job:any){
  const p=job.payload;const q=String(p.query_template??"").replace("{trade}",p.trade??"Mixed").replace("{location}",p.geography==="US"?"United States":String(p.geography??"US"));let sr:any;
  const {data:sourceDef}=await db.schema("booked_solid").from("source_catalog").select("*").eq("slug",p.source_slug).maybeSingle();
+ const discoveryTier=String(sourceDef?.metadata?.discovery_tier??sourceDef?.metadata?.lead_yield?.tier??"testing");
+ const discoveryCompanyCap=discoveryTier==="exploration_only"?2:discoveryTier==="testing"?3:5;
  if(p.source_slug==="openstreetmap_overpass")sr=await searchOSM(p.trade,p.geography,p.latitude,p.longitude);
  else if(p.source_slug==="wikidata_sparql")sr=await searchWikidata(p.geography,p.latitude,p.longitude);
  else if(p.source_slug==="chicago_building_permits"||p.source_slug==="nyc_dob_permits"||p.source_slug==="austin_construction_permits"||p.source_slug==="seattle_building_permits"||p.source_slug==="boston_building_permits"||p.source_slug==="sf_building_permit_contacts"||p.source_slug==="philadelphia_permit_contractors"||p.source_slug==="denver_commercial_permits")sr=await searchPermitSource(p.source_slug,p.trade,p.geography,p.latitude,p.longitude);
@@ -888,7 +970,7 @@ async function discover(job:any){
  else if(sourceDef?.metadata?.adapter==="generic_socrata")sr=await searchGenericSocrata(sourceDef,p.trade??"Mixed");
  else if(sourceDef?.metadata?.adapter==="generic_arcgis")sr=await searchGenericArcGIS(sourceDef,p.trade??"Mixed");
  else sr=await search(q);let n=0;
- for(const item of sr.results){if(n>=5)break;const itemName=String(item.title??"").trim();const domain=domainOf(item.url??"");const sourceLoc=locationFromMeta(item.meta??{},sr.provider,item.meta?.source_url??item.url,Number(item.meta?.evidence_confidence??(sr.provider==="openstreetmap_overpass"?88:90)));if(!domain&&item.meta?.needs_website_resolution){
+ for(const item of sr.results){if(n>=discoveryCompanyCap)break;const itemName=String(item.title??"").trim();const domain=domainOf(item.url??"");const sourceLoc=locationFromMeta(item.meta??{},sr.provider,item.meta?.source_url??item.url,Number(item.meta?.evidence_confidence??(sr.provider==="openstreetmap_overpass"?88:90)));if(!domain&&item.meta?.needs_website_resolution){
    if(itemName.length<3)continue;const nn=normalize(itemName);let c:any;let existingByName:any=null;let identityMethod:string|null=null;
    const sourceState=String(sourceLoc?.state??item.meta?.state??"").trim().toUpperCase();
    const sourceLocation=normalize(String(sourceLoc?.location_text??""));
