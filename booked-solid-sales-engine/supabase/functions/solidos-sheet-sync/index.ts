@@ -291,7 +291,7 @@ async function coreSync(token:string){
   const meta=await sheetMetadata(id,token), sm=sheetIdMap(meta);
   const nowIso=new Date().toISOString();
 
-  const [companies,leads,contacts,evidence,messages,settingsRows,work,sourceRows,strategyRows]=await Promise.all([
+  const [companies,leads,contacts,evidence,messages,settingsRows,work,sourceRows,strategyRows,priorityYieldRows,priorityEnrichmentRows]=await Promise.all([
     fetchAllBooked("companies","*","updated_at",false),
     fetchAllBooked("leads","*","opportunity_score",false),
     fetchAllBooked("contacts","*","updated_at",false),
@@ -300,7 +300,9 @@ async function coreSync(token:string){
     fetchAllBooked("runtime_settings","*"),
     fetchAllBooked("work_queue","id,status,kind,available_at,locked_at,attempts,last_error,updated_at"),
     fetchAllBooked("source_catalog","slug,enabled,lifecycle_state,consecutive_errors,metadata"),
-    fetchAllBooked("search_strategies","id,enabled,lifecycle_state")
+    fetchAllBooked("search_strategies","id,enabled,lifecycle_state"),
+    fetchAllBooked("priority_yield_snapshot","*","yield_score",false),
+    fetchAllBooked("priority_enrichment_log","*","updated_at",false)
   ]);
 
   const settings=settingsRows?.[0]||{};
@@ -413,6 +415,7 @@ async function coreSync(token:string){
     ["Last Sync",nowIso,"Writer","SolidOS Native","Backpressure",backpressure?"ON":"OFF","Warnings",warningCount],
     ["PRIORITY DISTRIBUTION","","","","","","",""],
     ["HOT",priCounts.hot||0,"HIGH",priCounts.high||0,"SIGNAL",priCounts.signal||0,"STANDARD",priCounts.standard||0],
+    ["HOT+HIGH YIELD",qualified.length?Math.round(((Number(priCounts.hot||0)+Number(priCounts.high||0))/qualified.length)*1000)/10+"%":"0%","PRIORITY YIELD ENGINE","ON","EXPLOIT / EXPLORE","70 / 30","THRESHOLDS","UNCHANGED"],
     ["CONTACT ROUTES","","","","","","",""],
     ["EMAIL READY",ready.length,"CONTACT FORM",contactForms.length,"PHONE ONLY",phoneOnly.length,"TOTAL QUALIFIED",qualified.length],
     ["","","","","","","",""],
@@ -536,6 +539,35 @@ async function coreSync(token:string){
       "SolidOS live sync; full CRM tabs refreshed; email/SMS/buyer outreach OFF.",namedDM,qualified.length,contactForms.length,phoneOnly.length]);
   }
 
+  const promotedCount=priorityEnrichmentRows.filter((x:any)=>String(x.status)==="promoted").length;
+  const completedEnrichment=priorityEnrichmentRows.filter((x:any)=>["completed","promoted"].includes(String(x.status))).length;
+  const yieldRanked=[...priorityYieldRows].sort((a:any,b:any)=>
+    Number(b.yield_score||0)-Number(a.yield_score||0) ||
+    Number(b.sample_count||0)-Number(a.sample_count||0)
+  );
+  const priorityEngine:any[][]=[
+    ["PRIORITY YIELD ENGINE","","","","","","","","","",""],
+    ["Policy","70% exploit / 30% explore","Thresholds","UNCHANGED","Qualified",qualified.length,"HOT+HIGH",Number(priCounts.hot||0)+Number(priCounts.high||0),"Yield",qualified.length?Math.round(((Number(priCounts.hot||0)+Number(priCounts.high||0))/qualified.length)*1000)/10+"%":"0%",""],
+    ["HOT",priCounts.hot||0,"HIGH",priCounts.high||0,"SIGNAL",priCounts.signal||0,"STANDARD",priCounts.standard||0,"Promotions",promotedCount,""],
+    ["Enrichment completed",completedEnrichment,"Enrichment queued",priorityEnrichmentRows.filter((x:any)=>String(x.status)==="queued").length,"Last refresh",nowIso,"","","","",""],
+    ["","","","","","","","","","",""],
+    ["YIELD BY DIMENSION","","","","","","","","","",""],
+    ["Dimension","Key","Sample","HOT","HIGH","SIGNAL","STANDARD","HOT+HIGH Yield","Yield Score","Avg Opportunity","Avg Trigger"],
+    ...yieldRanked.slice(0,60).map((x:any)=>[
+      x.dimension_type||"",x.dimension_key||"",Number(x.sample_count)||0,Number(x.hot_count)||0,Number(x.high_count)||0,
+      Number(x.signal_count)||0,Number(x.standard_count)||0,
+      Number(x.hot_high_yield||0),Number(x.yield_score||0),Number(x.avg_opportunity||0),Number(x.avg_trigger||0)
+    ]),
+    ["","","","","","","","","","",""],
+    ["RECENT NEAR-THRESHOLD ENRICHMENT","","","","","","","","","",""],
+    ["Company","Status","Target","Before Band","Before Opp","Before Trigger","After Band","After Opp","After Trigger","Attempts","Updated"],
+    ...priorityEnrichmentRows.slice(0,40).map((x:any)=>[
+      companyById.get(x.company_id)?.name||"",x.status||"",x.target_band||"",x.before_band||"",Number(x.before_opportunity)||0,
+      Number(x.before_trigger)||0,x.after_band||"",x.after_opportunity===null||x.after_opportunity===undefined?"":Number(x.after_opportunity),
+      x.after_trigger===null||x.after_trigger===undefined?"":Number(x.after_trigger),Number(x.attempts)||0,x.updated_at||""
+    ])
+  ];
+
   const sys=[["Metric","Value"],
     ["Snapshot",nowIso],["Writer","SolidOS Native Sheets"],["Sync cadence","~2 minutes when data changes"],
     ["Search",settings.search_enabled?"ON":"OFF"],["Email",settings.email_enabled?"ON":"OFF"],["SMS",settings.sms_enabled?"ON":"OFF"],["Buyer outreach","OFF"],
@@ -544,6 +576,8 @@ async function coreSync(token:string){
     ["Contacts",contacts.length],["Evidence",evidence.length],["Due Work",dueNow],["Running Work",runningWork],["Future Work",futureWork],
     ["Failed History",failedHistory],["Blocked Work",blockedWork],["Resolve Backlog",resolveBacklog],["Stale Running",staleRunning],["Backpressure",backpressure?"ON":"OFF"],
     ["Sources Enabled",enabledSources],["Sources Cooling",coolingSources],["Sources Degraded",degradedSources],["Strategies Enabled",enabledStrategies],
+    ["Priority Yield Engine","ON"],["Priority Search Split","70% exploit / 30% explore"],["HOT threshold","Opportunity >=80 AND Trigger >=35"],["HIGH threshold","Opportunity >=70"],
+    ["HOT+HIGH Yield",qualified.length?Math.round(((Number(priCounts.hot||0)+Number(priCounts.high||0))/qualified.length)*1000)/10+"%":"0%"],
     ["Data Quality",warningCount===0?"PASS":"WARNING"],["Warnings",warningCount]
   ];
 
@@ -560,8 +594,9 @@ async function coreSync(token:string){
   await writeTab(id,sm,"DATA QUALITY",dq,token,500,10);
   await writeTab(id,sm,"HOURLY LOG",logRows,token,1000,24);
   await writeTab(id,sm,"SYSTEM STATUS",sys,token,300,10);
+  await writeTab(id,sm,"PRIORITY ENGINE",priorityEngine,token,1000,11);
 
-  const check=await readValues(id,"COMMAND CENTER!A1:H24",token);
+  const check=await readValues(id,"COMMAND CENTER!A1:H25",token);
   return {ok:true,companies:companies.length,leads:leads.length,qualified:qualified.length,candidates:candidates.length,
     ready:ready.length,contact_forms:contactForms.length,phone_only:phoneOnly.length,contacts:contacts.length,evidence:evidence.length,
     due_work:dueNow,running_work:runningWork,command_rows:(check.values||[]).length};
