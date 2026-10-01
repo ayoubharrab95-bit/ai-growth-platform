@@ -255,11 +255,20 @@ async function planCycle(body: any) {
   const selectionPool = diversified.length ? diversified : candidates;
   const diversificationApplied = Boolean(candidates.length && selectionPool.length && candidates[0]?.id!==selectionPool[0]?.id);
 
-  // True 70/30 exploit/explore selection. With the normal 3-job planner cycle
-  // this means two proven-yield strategies plus one exploration strategy.
-  const exploreN = requestedLimit<=1 ? 0 : Math.max(1,Math.round(requestedLimit*0.30));
-  const exploitN = Math.max(1,requestedLimit-exploreN);
-  const exploit = selectionPool.slice(0,exploitN).map((x:any)=>({...x,priority_selection_mode:"exploit"}));
+  // Rolling 70/30 exploit/explore allocation. This keeps the ratio near
+  // 70/30 even when backpressure shrinks a planner cycle to only 1-2 jobs.
+  const recentModes=(recentDiscover??[])
+    .map((x:any)=>String(x.payload?.priority_selection_mode||""))
+    .filter((x:string)=>x==="exploit"||x==="explore");
+  const recentExplore=recentModes.filter((x:string)=>x==="explore").length;
+  const projectedTotal=recentModes.length+requestedLimit;
+  const targetExplore=Math.round(projectedTotal*0.30);
+  const maxExplore=requestedLimit;
+  const exploreN=Math.max(0,Math.min(maxExplore,targetExplore-recentExplore));
+  const exploitN=Math.max(0,requestedLimit-exploreN);
+  const exploit = exploitN>0
+    ? selectionPool.slice(0,exploitN).map((x:any)=>({...x,priority_selection_mode:"exploit"}))
+    : [];
   const exploitIds = new Set(exploit.map((x:any)=>x.id));
   const exploration = selectionPool
     .filter((x:any)=>!exploitIds.has(x.id))
