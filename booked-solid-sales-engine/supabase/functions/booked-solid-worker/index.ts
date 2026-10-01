@@ -963,7 +963,10 @@ async function locationEnrich(job:any){
 async function research(job:any){
  const {data:c,error}=await db.schema("booked_solid").from("companies").select("*").eq("id",job.payload.company_id).single();if(error)throw error;
  const root=new URL(c.website_url);if(root.protocol!=="https:")throw new Error("HTTPS_REQUIRED");
- const paths=["/","/about","/services","/contact","/team","/our-team","/leadership","/estimate","/careers","/locations","/commercial","/projects","/portfolio"];
+ const priorityYieldEnrichment=Boolean(job.payload?.priority_yield_enrichment);
+ const basePaths=["/","/about","/services","/contact","/team","/our-team","/leadership","/estimate","/careers","/locations","/commercial","/projects","/portfolio"];
+ const priorityPaths=["/jobs","/employment","/news","/blog","/press","/service-areas","/case-studies","/testimonials","/request-a-quote","/request-estimate","/financing","/industries"];
+ const paths=priorityYieldEnrichment?[...new Set([...basePaths,...priorityPaths])]:basePaths;
  let combined="";let pages=0;const emails=new Set<string>();const phones=new Map<string,any>();let structuredLocation:any=null;
  const pageResults=await Promise.all(paths.map(async p=>{try{const r=await fetch(new URL(p,root),{redirect:"follow",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});if(!r.ok)return null;const declared=Number(r.headers.get("content-length")||0);if(Number.isFinite(declared)&&declared>1500000)return null;const raw=await r.text();const h=raw.slice(0,300000);const visible=clean(h).slice(0,80000);return {p,h,url:new URL(p,root).toString(),visible};}catch{return null;}}));
  for(const pg of pageResults){if(!pg)continue;pages++;combined=(combined+" "+pg.visible).slice(0,500000);const pageLoc=jsonLdLocation(pg.h,pg.url);if(pageLoc&&!structuredLocation)structuredLocation=pageLoc;for(const e of pg.visible.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[]){const em=e.toLowerCase();const ed=em.split("@")[1];const hd=root.hostname.toLowerCase().replace(/^www\./,"");if(ed===hd||ed.endsWith("."+hd))emails.add(em);}for(const ph of extractPhoneCandidates(pg.visible,pg.url,pg.p)){const prev=phones.get(ph.phone);if(!prev||Number(ph.phone_confidence)>Number(prev.phone_confidence))phones.set(ph.phone,ph);}}
@@ -1015,10 +1018,10 @@ async function research(job:any){
    else await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:"intel_decision_maker",claim:dmClaim,snippet:null,source_url:person.source_url,confidence:person.confidence,metadata:{intelligence_version:2,role:person.role,public_named_contact:true}});
  }
  for(const email of [...emails].filter((e:string)=>mailboxKind(e)!=="weak")){const {data:existingContact}=await db.schema("booked_solid").from("contacts").select("id").eq("company_id",c.id).eq("email",email).maybeSingle();if(existingContact)await db.schema("booked_solid").from("contacts").update({email_confidence:75,source_url:root.toString(),status:"unverified"}).eq("id",existingContact.id);else await db.schema("booked_solid").from("contacts").insert({company_id:c.id,email,email_confidence:75,source_url:root.toString(),status:"unverified"});}for(const ph of phones.values()){const {data:ep}=await db.schema("booked_solid").from("contacts").select("id,phone_confidence").eq("company_id",c.id).eq("phone",ph.phone).limit(1);if((ep??[]).length)await db.schema("booked_solid").from("contacts").update({phone_type:ph.phone_type,phone_confidence:Math.max(Number(ep![0].phone_confidence||0),Number(ph.phone_confidence||0)),phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",ep![0].id);else await db.schema("booked_solid").from("contacts").insert({company_id:c.id,phone:ph.phone,phone_type:ph.phone_type,phone_confidence:ph.phone_confidence,phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),status:"unverified"});}
- const locationPatch:any={last_researched_at:new Date().toISOString(),last_enriched_at:new Date().toISOString(),enrichment_version:2,status:c.metadata?.hard_excluded_vendor?"rejected":c.status==="qualified"?"qualified":"discovered",metadata:{...(c.metadata??{}),research_pages:pages,supplemental_searches:supplemental.length,phones_found:phones.size,trigger_types:triggers.map((x:any)=>x.type),website_intelligence_version:2,website_intelligence:{...websiteProfile,decision_makers:websitePeople.map((x:any)=>({name:x.full_name,role:x.role,email:x.email||null,phone:Boolean(x.phone),confidence:x.confidence,source_url:x.source_url}))},decision_makers_found:websitePeople.length,...(structuredLocation&&(!c.location_text||!c.state)?{location_provenance:c.metadata?.location_provenance??structuredLocation.provenance}:{})}};
+ const locationPatch:any={last_researched_at:new Date().toISOString(),last_enriched_at:new Date().toISOString(),enrichment_version:2,status:c.metadata?.hard_excluded_vendor?"rejected":c.status==="qualified"?"qualified":"discovered",metadata:{...(c.metadata??{}),research_pages:pages,supplemental_searches:supplemental.length,phones_found:phones.size,trigger_types:triggers.map((x:any)=>x.type),website_intelligence_version:2,website_intelligence:{...websiteProfile,decision_makers:websitePeople.map((x:any)=>({name:x.full_name,role:x.role,email:x.email||null,phone:Boolean(x.phone),confidence:x.confidence,source_url:x.source_url}))},decision_makers_found:websitePeople.length,...(priorityYieldEnrichment?{priority_yield_last_researched_at:new Date().toISOString(),priority_yield_target_band:job.payload?.target_band||null}:{}) ,...(structuredLocation&&(!c.location_text||!c.state)?{location_provenance:c.metadata?.location_provenance??structuredLocation.provenance}:{})}};
  if(structuredLocation){if(!c.location_text)locationPatch.location_text=structuredLocation.location_text;if(!c.state&&structuredLocation.state)locationPatch.state=structuredLocation.state;if(!c.country&&structuredLocation.country)locationPatch.country=structuredLocation.country;}
  await db.schema("booked_solid").from("companies").update(locationPatch).eq("id",c.id);
- await db.schema("booked_solid").from("work_queue").insert({kind:"qualify",priority:Number(job.priority)+5,payload:{company_id:c.id,strategy_id:job.payload.strategy_id},status:"pending"});
+ await db.schema("booked_solid").from("work_queue").insert({kind:"qualify",priority:Number(job.priority)+5,payload:{company_id:c.id,strategy_id:job.payload.strategy_id,...(priorityYieldEnrichment?{lead_id:job.payload?.lead_id||null,reason:"priority_yield_requalify",priority_yield_enrichment:true,target_band:job.payload?.target_band||null}:{})},status:"pending"});
  return {pages,signals:types,triggers:triggers.map((x:any)=>({type:x.type,strength:x.strength})),emails:emails.size,phones:phones.size,decision_makers:websitePeople.length,website_profile:{services:websiteProfile.services,capabilities:websiteProfile.capabilities,hiring_roles:websiteProfile.hiring_roles},intelligence_version:2,supplemental_results:supplemental.length,gap_fill_used:missingName||missingContact||combined.length<500};
 }
 
@@ -1353,6 +1356,20 @@ async function qualify(job:any){
  const existing=priorQualified??(existingLeads??[]).find((x:any)=>x.offer===offer)??(existingLeads??[])[0];let lead:any;
  if(existing){const {data:u,error:ue}=await db.schema("booked_solid").from("leads").update(leadPayload).eq("id",existing.id).select("*").single();if(ue)throw ue;lead=u;}
  else{const {data:i,error:ie}=await db.schema("booked_solid").from("leads").insert(leadPayload).select("*").single();if(ie)throw ie;lead=i;}
+ if(job.payload?.priority_yield_enrichment===true){
+  const promoted=(String(lead.priority_band||"").toLowerCase()==="hot"&&String(job.payload?.target_band||"")==="hot")
+    ||(["high","hot"].includes(String(lead.priority_band||"").toLowerCase())&&String(job.payload?.target_band||"")==="high");
+  await db.schema("booked_solid").from("priority_enrichment_log").update({
+    last_completed_at:new Date().toISOString(),
+    after_band:lead.priority_band,
+    after_opportunity:lead.opportunity_score,
+    after_trigger:lead.trigger_score,
+    status:promoted?"promoted":"completed",
+    last_reason:promoted?"priority_threshold_reached":"priority_enrichment_completed",
+    metadata:{target_band:job.payload?.target_band||null,promoted,completed_by:"qualify"},
+    updated_at:new Date().toISOString()
+  }).eq("lead_id",lead.id);
+ }
  if(status==="qualified"){
   const {data:cq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","contact").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
   if(!(cq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:score+10+Math.min(15,triggerScore*0.15),payload:{lead_id:lead.id,company_id:id},status:"pending"});
