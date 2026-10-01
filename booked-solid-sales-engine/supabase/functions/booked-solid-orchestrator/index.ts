@@ -205,11 +205,16 @@ async function planCycle(body: any) {
   const osmCooldownRaw=String(osmPressureSource?.metadata?.cooldown_until||"");
   const osmCooldownMs=osmCooldownRaw?new Date(osmCooldownRaw).getTime():0;
   const osmCooling=Number.isFinite(osmCooldownMs)&&osmCooldownMs>Date.now();
-  const pressureReason=dueNow>60||runningNow>20
-    ?"pipeline_backpressure"
-    :resolveNow>250
-      ?(osmCooling?"resolve_backlog_source_cooling":"resolve_backlog")
-      :null;
+  const {data:pipelinePressure,error:pressureErr}=await db.rpc("solidos_pipeline_pressure");
+  const pc=(!pressureErr&&pipelinePressure)?pipelinePressure:{};
+  const adaptivePause=Boolean(pc?.pause);
+  const pressureReason=adaptivePause
+    ?"adaptive_pipeline_pressure"
+    :(dueNow>60||runningNow>20
+      ?"pipeline_backpressure"
+      :resolveNow>250
+        ?(osmCooling?"resolve_backlog_source_cooling":"resolve_backlog")
+        :null);
   if(pressureReason){
     return json({
       ok:true,
@@ -221,15 +226,24 @@ async function planCycle(body: any) {
         due_now:dueNow,
         running:runningNow,
         resolve_backlog:resolveNow,
+        discovery_due:Number(pc?.discovery_due||0),
+        downstream_due:Number(pc?.downstream_due||0),
+        downstream_oldest_seconds:Number(pc?.downstream_oldest_seconds||0),
+        arrivals_15m:Number(pc?.arrivals_15m||0),
+        completed_15m:Number(pc?.completed_15m||0),
+        arrival_completion_ratio:Number(pc?.arrival_completion_ratio||0),
+        stale_running:Number(pc?.stale_running||0),
         osm_cooling:osmCooling,
         osm_cooldown_until:osmCooldownRaw||null,
-        resume_when:"due_now<=60 AND running<=20 AND resolve_backlog<=250"
+        resume_when:"adaptive pressure clears; no stale workers; downstream queue within SLA"
       },
       email_gate:"blocked_until_email_configuration",
       discovery_preserved:true
     },200);
   }
-  const requestedLimit=dueNow>30?1:dueNow>15?2:requestedCap;
+  const recommended=Number(pc?.recommended_limit);
+  const adaptiveLimit=Number.isFinite(recommended)&&recommended>0?recommended:(dueNow>30?1:dueNow>15?2:requestedCap);
+  const requestedLimit=Math.max(1,Math.min(requestedCap,adaptiveLimit));
   const ranked = await chooseStrategies(100);
   const { data: marketRows } = await db.schema("booked_solid").from("market_catalog").select("*").in("lifecycle_state",["testing","active"]);
   const { data: activeDiscover } = await db.schema("booked_solid").from("work_queue").select("payload,status").eq("kind","discover").in("status",["pending","running"]);
