@@ -34,9 +34,12 @@ function marketFor(s:any,marketRows:any[]=[]){
  if(s.geography&&s.geography!=="US")return s.geography;
  const live=(marketRows??[]).filter((m:any)=>["testing","active"].includes(String(m.lifecycle_state||"active"))&&Number.isFinite(Number(m.latitude))&&Number.isFinite(Number(m.longitude)));
  if(live.length){
-   const ranked=[...live].sort((a:any,b:any)=>(Number(b.quality_score||50)+Number(b.exploration_weight||1)*8)-(Number(a.quality_score||50)+Number(a.exploration_weight||1)*8));
-   const explore=(hashText(String(s.slug)+":"+String(s.uses_count??0))%100)<20;
-   const pool=explore?live:ranked.slice(0,Math.max(8,Math.ceil(ranked.length*0.6)));
+   const ranked=[...live].sort((a:any,b:any)=>{
+     const rank=(x:any)=>Number(x.quality_score||50)+Number(x.exploration_weight||1)*7+Number(x.metadata?.priority_yield_score||25)*0.35;
+     return rank(b)-rank(a);
+   });
+   const explore=(hashText(String(s.slug)+":"+String(s.uses_count??0))%100)<30;
+   const pool=explore?live:ranked.slice(0,Math.max(6,Math.ceil(ranked.length*0.5)));
    const idx=(hashText(String(s.slug))+Number(s.uses_count??0))%pool.length;
    return pool[idx].display_name;
  }
@@ -63,21 +66,36 @@ async function chooseStrategies(limit = 50) {
 
   if (error) throw error;
 
-  // 80/20 style rotation without hard-coding a single winner:
-  // rank by a blend of proven performance, exploration weight, and staleness.
+  // Priority Yield Engine v1:
+  // exploitation is driven by proven strategy/trade HOT+HIGH yield while
+  // exploration weight and staleness keep new strategies from being starved.
   const now = Date.now();
   const ranked = (data ?? []).map((s: any) => {
     const ageHours = s.last_used_at
       ? Math.max(0, (now - new Date(s.last_used_at).getTime()) / 3600000)
       : 9999;
-    const freshnessBoost = Math.min(20, ageHours);
-    const explorationBoost = Number(s.exploration_weight ?? 1) * 10;
+    const freshnessBoost = Math.min(18, ageHours);
+    const explorationBoost = Number(s.exploration_weight ?? 1) * 8;
+    const directYield = Number(s.metadata?.priority_yield?.score ?? 25);
+    const tradeYield = Number(s.metadata?.trade_priority_yield_score ?? 25);
+    const sample = Number(s.metadata?.priority_yield?.sample ?? 0);
+    const confidence = Math.min(1, sample / 8);
+    const yieldBoost =
+      ((directYield - 25) * 0.35 * confidence) +
+      ((tradeYield - 25) * 0.18);
     const score =
       Number(s.performance_score ?? 50) +
       explorationBoost +
-      freshnessBoost -
+      freshnessBoost +
+      yieldBoost -
       Math.min(20, Number(s.uses_count ?? 0) * 0.05);
-    return { ...s, planner_score: score };
+    return {
+      ...s,
+      planner_score: score,
+      priority_yield_score: directYield,
+      trade_priority_yield_score: tradeYield,
+      priority_yield_sample: sample
+    };
   }).sort((a: any, b: any) => b.planner_score - a.planner_score);
 
   return ranked.slice(0, limit);
@@ -236,7 +254,27 @@ async function planCycle(body: any) {
   const diversified = candidates.filter((s:any)=>(recentTradeCounts.get(String(s.trade??""))??0)<3);
   const selectionPool = diversified.length ? diversified : candidates;
   const diversificationApplied = Boolean(candidates.length && selectionPool.length && candidates[0]?.id!==selectionPool[0]?.id);
-  const strategies = selectionPool.slice(0, requestedLimit).map((s:any)=>({...s,target_location:marketFor(s,marketRows??[])}));
+
+  // True 70/30 exploit/explore selection. With the normal 3-job planner cycle
+  // this means two proven-yield strategies plus one exploration strategy.
+  const exploreN = requestedLimit<=1 ? 0 : Math.max(1,Math.round(requestedLimit*0.30));
+  const exploitN = Math.max(1,requestedLimit-exploreN);
+  const exploit = selectionPool.slice(0,exploitN).map((x:any)=>({...x,priority_selection_mode:"exploit"}));
+  const exploitIds = new Set(exploit.map((x:any)=>x.id));
+  const exploration = selectionPool
+    .filter((x:any)=>!exploitIds.has(x.id))
+    .sort((a:any,b:any)=>{
+      const rank=(x:any)=>{
+        const age=x.last_used_at?Math.min(36,(Date.now()-new Date(x.last_used_at).getTime())/3600000):36;
+        const lowSample=Math.max(0,8-Number(x.priority_yield_sample||0))*3;
+        return Number(x.exploration_weight||1)*18 + age + lowSample;
+      };
+      return rank(b)-rank(a);
+    })
+    .slice(0,exploreN)
+    .map((x:any)=>({...x,priority_selection_mode:"explore"}));
+  const selected=[...exploit,...exploration].slice(0,requestedLimit);
+  const strategies = selected.map((s:any)=>({...s,target_location:marketFor(s,marketRows??[])}));
   const { data: allEnabledSources } = await db.schema("booked_solid").from("source_catalog").select("*").eq("enabled",true);
   const coolingSources=(allEnabledSources??[]).filter((x:any)=>sourceCooling(x));
   const degradedSources=(allEnabledSources??[]).filter((x:any)=>!sourceCooling(x)&&(Number(x.consecutive_errors||0)>=4||String(x.metadata?.state||"")==="degraded"));
@@ -258,11 +296,41 @@ async function planCycle(body: any) {
   const autoActiveSources=(sources??[])
     .filter((x:any)=>["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||""))&&["active","canary"].includes(String(x.lifecycle_state||"")))
     .sort((a:any,b:any)=>{
-      const life=(x:any)=>x.lifecycle_state==="active"?100:0;
-      return (life(b)+Number(b.quality_score||50)+Number(b.exploration_weight||1)*8)
-            -(life(a)+Number(a.quality_score||50)+Number(a.exploration_weight||1)*8);
+      const rank=(x:any)=>{
+        const life=x.lifecycle_state==="active"?100:0;
+        return life+Number(x.quality_score||50)+Number(x.exploration_weight||1)*7+Number(x.metadata?.priority_yield_score||25)*0.35;
+      };
+      return rank(b)-rank(a);
     });
   const osmTrades=new Set(["Roofing","Commercial Roofing","HVAC","Commercial HVAC","Plumbing","Electrical","Painting","Flooring","Landscaping","General Contractor","Commercial Contractor","Construction","Windows","Deck Builder","Deck Patio","Cabinet","Remodeling","Bathroom Remodeling","Kitchen Remodeling","Kitchen Bath Remodeling","Home Builder","Custom Home Builder","Siding","Concrete","Mixed","Property Operations"]);
+  const sourceTradeHint=(source:any)=>{
+    const explicit=String(source?.metadata?.trade_hint||source?.metadata?.source_trade_hint||"").trim();
+    if(explicit)return explicit;
+    // Datasets with an explicit trade column are multi-trade sources; row-level
+    // trade classification remains authoritative.
+    if(source?.metadata?.field_map?.trade)return "Mixed";
+    const text=(String(source?.name||"")+" "+String(source?.slug||"")+" "+String(source?.metadata?.public_url||"")).toLowerCase();
+    if(/plumb/.test(text))return "Plumbing";
+    if(/electric/.test(text))return "Electrical";
+    if(/hvac|heating|air.?conditioning|mechanical/.test(text))return "HVAC";
+    if(/roof/.test(text))return "Roofing";
+    if(/landscap/.test(text))return "Landscaping";
+    if(/paint/.test(text))return "Painting";
+    if(/floor/.test(text))return "Flooring";
+    if(/concrete/.test(text))return "Concrete";
+    if(/remodel|renovation/.test(text))return "Remodeling";
+    if(/builder|construction|building permits?/.test(text))return "Mixed";
+    return "Mixed";
+  };
+  const tradeCompatible=(source:any,trade:string)=>{
+    const hint=sourceTradeHint(source);
+    if(hint==="Mixed"||trade==="Mixed")return true;
+    const t=String(trade||"");
+    if(hint==="Roofing"&&["Roofing","Commercial Roofing"].includes(t))return true;
+    if(hint==="HVAC"&&["HVAC","Commercial HVAC"].includes(t))return true;
+    if(hint==="General Contractor"&&["General Contractor","Commercial Contractor","Construction"].includes(t))return true;
+    return hint===t;
+  };
   const discoveryCapable=(source:any,trade:string,market:string)=>{
     if(!source)return false;
     const slug=String(source.slug||"");
@@ -272,7 +340,7 @@ async function planCycle(body: any) {
     const adapter=String(source.metadata?.adapter||"");
     if(["generic_socrata","generic_arcgis"].includes(adapter)){
       const sm=String(source.metadata?.market_hint||source.metadata?.market||"");
-      return !sm||sm===market;
+      return (!sm||sm===market)&&tradeCompatible(source,trade);
     }
     const sm=String(source.metadata?.market_hint||source.metadata?.market||"");
     if(citySources.some((x:any)=>x?.slug===slug))return Boolean(sm)&&sm===market;
@@ -281,21 +349,29 @@ async function planCycle(body: any) {
   const chooseBaseSource=(s:any)=>{
     const trade=String(s.trade||"Mixed"),market=String(s.target_location||"US");
     const useCount=Number(s.uses_count||0);
+    const sourceRank=(x:any)=>Number(x?.quality_score||50)+Number(x?.exploration_weight||1)*7+Number(x?.metadata?.priority_yield_score||25)*0.35;
+    const pick=(arr:any[],salt:string)=>{
+      if(!arr.length)return null;
+      const ranked=[...arr].sort((a:any,b:any)=>sourceRank(b)-sourceRank(a));
+      const explore=(hashText(String(s.slug)+":"+salt+":"+useCount)%100)<30;
+      const pool=explore?ranked:ranked.slice(0,Math.max(1,Math.ceil(ranked.length*0.5)));
+      return pool[hashText(String(s.slug)+":"+salt+":"+useCount)%pool.length];
+    };
     if(discoveryCapable(osmSource,trade,market))return osmSource;
-    const city=citySources.find((x:any)=>discoveryCapable(x,trade,market));if(city)return city;
+    const cities=citySources.filter((x:any)=>discoveryCapable(x,trade,market));
+    if(cities.length)return pick(cities,"city");
     const generics=autoActiveSources.filter((x:any)=>discoveryCapable(x,trade,market));
-    if(generics.length)return generics[hashText(String(s.slug)+":"+useCount)%generics.length];
+    if(generics.length)return pick(generics,"generic");
     if(discoveryCapable(usaSpendingSource,trade,market))return usaSpendingSource;
     if(discoveryCapable(nrcaSource,trade,market))return nrcaSource;
 
     // Source-backed market fallback: keep discovery moving when the strategy's
-    // preferred market has no healthy free source. The job market is replaced
-    // below by the selected source's authoritative market hint/market.
+    // preferred market has no healthy free source.
     const fallbackGenerics=autoActiveSources.filter((x:any)=>Boolean(x?.metadata?.market_hint||x?.metadata?.market));
-    if(fallbackGenerics.length)return fallbackGenerics[hashText(String(s.slug)+":fallback:"+useCount)%fallbackGenerics.length];
+    if(fallbackGenerics.length)return pick(fallbackGenerics,"fallback");
     const fallbackCities=citySources.filter((x:any)=>Boolean(x?.metadata?.market_hint||x?.metadata?.market));
-    if(fallbackCities.length)return fallbackCities[hashText(String(s.slug)+":city:"+useCount)%fallbackCities.length];
-    return autoActiveSources.length?autoActiveSources[hashText(String(s.slug)+":canary:"+useCount)%autoActiveSources.length]:null;
+    if(fallbackCities.length)return pick(fallbackCities,"fallback-city");
+    return pick(autoActiveSources,"canary");
   };
   if (!strategies.length) {
     return json({ ok: true, paused: true, reason: "no_strategy_available" }, 200);
@@ -332,6 +408,10 @@ async function planCycle(body: any) {
         latitude:jobLat,
         longitude:jobLon,
         offer_hint:s.offer_hint,
+        priority_selection_mode:s.priority_selection_mode||"exploit",
+        strategy_priority_yield_score:Number(s.priority_yield_score||25),
+        trade_priority_yield_score:Number(s.trade_priority_yield_score||25),
+        source_priority_yield_score:Number(source?.metadata?.priority_yield_score||25),
         evolution_source:Boolean(source?.metadata?.discovered_by==="self_evolution")
       },
       status:"pending",
@@ -408,6 +488,9 @@ async function planCycle(body: any) {
       query_template: s.query_template,
       offer_hint: s.offer_hint,
       planner_score: s.planner_score,
+      priority_selection_mode: s.priority_selection_mode||"exploit",
+      priority_yield_score: s.priority_yield_score,
+      trade_priority_yield_score: s.trade_priority_yield_score,
       market: s.target_location,
     })),
   });
