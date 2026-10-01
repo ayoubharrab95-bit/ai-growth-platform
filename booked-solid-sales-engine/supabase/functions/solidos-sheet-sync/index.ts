@@ -55,8 +55,11 @@ async function sheetMetadata(id:string,token:string){
   return await r.json();
 }
 function sheetIdMap(meta:any){
-  const m:any={};
-  for(const s of meta.sheets||[])m[s.properties.title]=s.properties.sheetId;
+  const m:any={__rows:{}};
+  for(const s of meta.sheets||[]){
+    m[s.properties.title]=s.properties.sheetId;
+    m.__rows[s.properties.title]=Number(s.properties?.gridProperties?.rowCount||0);
+  }
   return m;
 }
 function cell(v:any){
@@ -284,7 +287,18 @@ function fmtPri(p:any){return String(p||"standard").toUpperCase();}
 function sortLeads(a:any,b:any){return priRank(b.priority_band)-priRank(a.priority_band)||(Number(b.opportunity_score)||0)-(Number(a.opportunity_score)||0);}
 async function writeTab(id:string,sm:any,name:string,rows:any[][],token:string,maxRows:number,maxCols:number){
   if(sm[name]===undefined)throw new Error("CORE:missing_tab:"+name);
-  await batchUpdate(id,updateRows(sm[name],rows,maxCols,maxRows),token);
+  const currentRows=Number(sm.__rows?.[name]||0);
+  const requiredRows=Math.max(maxRows,rows.length+50,currentRows);
+  const requests:any[]=[];
+  if(currentRows>0&&requiredRows>currentRows){
+    requests.push({updateSheetProperties:{
+      properties:{sheetId:sm[name],gridProperties:{rowCount:requiredRows}},
+      fields:"gridProperties.rowCount"
+    }});
+    sm.__rows[name]=requiredRows;
+  }
+  requests.push(...updateRows(sm[name],rows,maxCols,requiredRows));
+  await batchUpdate(id,requests,token);
 }
 async function coreSync(token:string){
   const id=TARGETS.CORE_CRM.id;
