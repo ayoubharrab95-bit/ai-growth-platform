@@ -24,6 +24,12 @@ const MARKET_COORDS:Record<string,[number,number]>={
 "Minneapolis MN":[44.9778,-93.2650],"Detroit MI":[42.3314,-83.0458],"Oklahoma City OK":[35.4676,-97.5164],"Tulsa OK":[36.1540,-95.9928]
 };
 function hashText(s:string){let h=0;for(const ch of s)h=(h*31+ch.charCodeAt(0))>>>0;return h;}
+function sourceCooling(s:any){
+ const raw=s?.metadata?.cooldown_until;
+ if(!raw)return false;
+ const t=new Date(String(raw)).getTime();
+ return Number.isFinite(t)&&t>Date.now();
+}
 function marketFor(s:any,marketRows:any[]=[]){
  if(s.geography&&s.geography!=="US")return s.geography;
  const live=(marketRows??[]).filter((m:any)=>["testing","active"].includes(String(m.lifecycle_state||"active"))&&Number.isFinite(Number(m.latitude))&&Number.isFinite(Number(m.longitude)));
@@ -131,7 +137,9 @@ async function planCycle(body: any) {
   const selectionPool = diversified.length ? diversified : candidates;
   const diversificationApplied = Boolean(candidates.length && selectionPool.length && candidates[0]?.id!==selectionPool[0]?.id);
   const strategies = selectionPool.slice(0, requestedLimit).map((s:any)=>({...s,target_location:marketFor(s,marketRows??[])}));
-  const { data: sources } = await db.schema("booked_solid").from("source_catalog").select("*").eq("enabled",true);
+  const { data: allEnabledSources } = await db.schema("booked_solid").from("source_catalog").select("*").eq("enabled",true);
+  const coolingSources=(allEnabledSources??[]).filter((x:any)=>sourceCooling(x));
+  const sources=(allEnabledSources??[]).filter((x:any)=>!sourceCooling(x));
   const sourceBySlug=new Map((sources??[]).map((x:any)=>[x.slug,x]));
   const osmSource=sourceBySlug.get("openstreetmap_overpass");
   const nrcaSource=sourceBySlug.get("nrca_official");
@@ -147,12 +155,19 @@ async function planCycle(body: any) {
   const usaSpendingSource=sourceBySlug.get("usaspending_api");
   const autoActiveSources=(sources??[]).filter((x:any)=>["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||""))&&x.lifecycle_state==="active").sort((a:any,b:any)=>(Number(b.quality_score||50)+Number(b.exploration_weight||1)*8)-(Number(a.quality_score||50)+Number(a.exploration_weight||1)*8));
   const osmTrades=new Set(["Roofing","Commercial Roofing","HVAC","Commercial HVAC","Plumbing","Electrical","Painting","Flooring","Landscaping","General Contractor","Commercial Contractor","Construction","Windows","Deck Builder","Deck Patio","Cabinet","Remodeling","Bathroom Remodeling","Kitchen Remodeling","Kitchen Bath Remodeling","Home Builder","Custom Home Builder","Siding","Concrete","Mixed","Property Operations"]);
-  if (!strategies.length || !osmSource) {
-    return json({ ok: false, reason: "free_sources_not_available" }, 503);
+  if (!strategies.length) {
+    return json({ ok: true, paused: true, reason: "no_strategy_available" }, 200);
+  }
+  const fallbackSource=osmSource??autoActiveSources[0]??usaSpendingSource??nrcaSource??chicagoPermitSource??nycPermitSource??austinPermitSource??seattlePermitSource??bostonPermitSource??sfPermitSource??philadelphiaPermitSource??philadelphiaTradeLicenseSource??denverPermitSource;
+  if(!fallbackSource){
+    return json({
+      ok:true,paused:true,reason:"all_free_sources_cooling_or_unavailable",
+      cooling_sources:coolingSources.map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
+    },200);
   }
   const jobs = strategies.map((s: any) => {
     const useCount=Number(s.uses_count??0);
-    let source:any=osmSource;
+    let source:any=fallbackSource;
     if(autoActiveSources.length && useCount%10===8) source=autoActiveSources[(hashText(String(s.slug)+":"+useCount))%autoActiveSources.length];
     else if(s.target_location==="Chicago IL" && chicagoPermitSource && useCount%4===2) source=chicagoPermitSource;
     else if(s.target_location==="New York NY" && nycPermitSource && useCount%4===2) source=nycPermitSource;
@@ -213,6 +228,12 @@ async function planCycle(body: any) {
     enrichment_queued: enrichment,
     discovery_preserved: true,
     enrichment_is_additive_not_a_gate: true,
+    source_health: {
+      healthy_enabled_sources: sources.length,
+      cooling_enabled_sources: coolingSources.length,
+      selected_source: queued?.[0]?.payload?.source_slug??null,
+      cooling_sources: coolingSources.slice(0,8).map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
+    },
     diversity: {
       recent_window_cycles: 8,
       max_attempts_per_trade: 3,
