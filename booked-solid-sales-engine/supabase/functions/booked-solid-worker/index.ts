@@ -885,9 +885,24 @@ async function resolveCompany(job:any){
  const osmCooling=Number.isFinite(osmCooldownMs)&&osmCooldownMs>Date.now(),geoCooling=Number.isFinite(geoCooldownMs)&&geoCooldownMs>Date.now();
  const osmDegraded=!osmHealth?.enabled||["degraded","paused","disabled"].includes(String(osmHealth?.lifecycle_state||"").toLowerCase());
  const locText=String(job.payload.location_text||c.metadata?.source_market||job.payload.geography||"").trim();
+ const resolutionCacheKey=normalize(String(c.name||""))+"|"+normalize(locText||String(c.state||""));
+ let cachedResolution:any=null;
+ try{
+  const {data:cached}=await db.schema("booked_solid").from("resolution_cache")
+    .select("*").eq("cache_key",resolutionCacheKey).gt("expires_at",new Date().toISOString()).maybeSingle();
+  if(cached?.domain&&(Number(cached.confidence||0)>=75||strongDomainNameMatch(String(c.name||""),String(cached.domain||"")))){
+    cachedResolution=cached;
+  }
+ }catch{}
 
  let hit:any=null;
- if(directWebsite)hit={url:directWebsite,title:c.name};
+ if(cachedResolution){
+  hit={url:cachedResolution.url||("https://"+cachedResolution.domain+"/"),title:c.name};
+  resolutionMethod="resolution_cache:"+String(cachedResolution.method||"verified");
+  resolutionConfidence=Number(cachedResolution.confidence||80);
+  preflight={cached:true,cache_key:resolutionCacheKey};
+ }
+ else if(directWebsite)hit={url:directWebsite,title:c.name};
  else{
   const guessed=await verifiedWebsiteFromNameGuess(c,locText);
   if(guessed){hit=guessed;resolutionMethod=guessed.method;resolutionConfidence=guessed.confidence;preflight=guessed;}
@@ -947,6 +962,21 @@ async function resolveCompany(job:any){
   return {resolved:true,merged_into:dupe.id,domain,resolution_method:resolutionMethod,merge:merged};
  }
  const preflightScore=Math.min(100,40+(resolutionConfidence>=90?25:18)+(c.state?10:0)+(c.trade?10:0)+(preflight?.email_domain?15:0));
+ try{
+  await db.schema("booked_solid").from("resolution_cache").upsert({
+    cache_key:resolutionCacheKey,
+    normalized_name:normalize(String(c.name||"")),
+    location_key:normalize(locText||String(c.state||"")),
+    domain,
+    url:"https://"+domain+"/",
+    method:resolutionMethod,
+    confidence:resolutionConfidence,
+    verified_at:new Date().toISOString(),
+    expires_at:new Date(Date.now()+7*24*60*60*1000).toISOString(),
+    metadata:{company_id:id,source_slug:c.source_first_seen||null},
+    updated_at:new Date().toISOString()
+  },{onConflict:"cache_key"});
+ }catch{}
  await db.schema("booked_solid").from("companies").update({
   canonical_domain:domain,website_url:"https://"+domain+"/",
   metadata:{...(c.metadata??{}),needs_website_resolution:false,resolved_via:resolutionMethod,resolution_confidence:resolutionConfidence,preflight_version:2,preflight_status:"passed",preflight_score:preflightScore,preflight_last_attempt_at:new Date().toISOString(),identity_version:2,identity_status:"domain_verified",identity_confidence:resolutionConfidence,verified_email_domain:preflight?.email_domain??null}
@@ -1046,6 +1076,24 @@ async function research(job:any){
  const {data:c,error}=await db.schema("booked_solid").from("companies").select("*").eq("id",job.payload.company_id).single();if(error)throw error;
  const root=new URL(c.website_url);if(root.protocol!=="https:")throw new Error("HTTPS_REQUIRED");
  const priorityYieldEnrichment=Boolean(job.payload?.priority_yield_enrichment);
+ const researchReason=String(job.payload?.reason||"");
+ const forceResearch=priorityYieldEnrichment||researchReason.includes("force")||researchReason.includes("recovery_deep");
+ const lastResearchMs=c.last_researched_at?new Date(c.last_researched_at).getTime():0;
+ const freshResearch=Number.isFinite(lastResearchMs)&&lastResearchMs>0&&(Date.now()-lastResearchMs)<2*60*60*1000
+   &&Number(c.metadata?.website_intelligence_version||0)>=2;
+ if(freshResearch&&!forceResearch){
+  const {data:qj}=await db.schema("booked_solid").from("work_queue").select("id")
+    .eq("kind","qualify").in("status",["pending","running"]).contains("payload",{company_id:c.id}).limit(1);
+  if(!(qj??[]).length){
+    await db.schema("booked_solid").from("work_queue").insert({
+      kind:"qualify",
+      priority:Number(job.priority)+4,
+      payload:{company_id:c.id,strategy_id:job.payload.strategy_id,reason:"research_fresh_cache"},
+      status:"pending"
+    });
+  }
+  return {cached:true,skipped_network:true,reason:"fresh_research_under_2h",last_researched_at:c.last_researched_at};
+ }
  const basePaths=["/","/about","/services","/contact","/team","/our-team","/leadership","/estimate","/careers","/locations","/commercial","/projects","/portfolio"];
  const priorityPaths=["/jobs","/employment","/news","/blog","/press","/service-areas","/case-studies","/testimonials","/request-a-quote","/request-estimate","/financing","/industries"];
  const paths=priorityYieldEnrichment?[...new Set([...basePaths,...priorityPaths])]:basePaths;
@@ -1549,9 +1597,13 @@ Deno.serve(async req=>{
     return out(await probeOpenStreetMapSource());
   }
   const batchSize=Math.max(1,Math.min(8,Number(requestBody.batch_size||4)));
+  const requestedLane=String(requestBody.lane||"auto").toLowerCase();
+  const allowedLanes=new Set(["auto","fast","resolve","research","qualify","contact","discovery","general"]);
+  const lane=allowedLanes.has(requestedLane)?requestedLane:"auto";
   const results:any[]=[];
   for(let batchIndex=0;batchIndex<batchSize;batchIndex++){
-   const {data:jobs,error}=await db.rpc("claim_booked_solid_work",{p_worker:"booked-solid-"+crypto.randomUUID()});
+   const workerId="booked-solid-"+lane+"-"+crypto.randomUUID();
+   const {data:jobs,error}=await db.rpc("claim_booked_solid_work_v2",{p_worker:workerId,p_lane:lane});
    if(error)throw error;
    const job=jobs?.[0];
    if(!job)break;
@@ -1569,7 +1621,8 @@ Deno.serve(async req=>{
     results.push({ok:true,job_id:job.id,kind:job.kind,deferred:true,result});
     continue;
    }
-   const {error:doneErr}=await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,locked_at:null,locked_by:null,updated_at:new Date().toISOString()}).eq("id",job.id);
+   const finishedAt=new Date().toISOString();
+   const {error:doneErr}=await db.schema("booked_solid").from("work_queue").update({status:"done",last_error:null,locked_at:null,locked_by:null,finished_at:finishedAt,updated_at:finishedAt}).eq("id",job.id);
    if(doneErr)throw doneErr;
    results.push({ok:true,job_id:job.id,kind:job.kind,result});
   }catch(e){
@@ -1581,18 +1634,21 @@ Deno.serve(async req=>{
    if(sourceSlug&&!policy.blocked){
     try{await db.schema("booked_solid").rpc("record_source_failure",{p_slug:sourceSlug,p_error:msg});}catch{}
    }
+   const failNow=new Date().toISOString();
    await db.schema("booked_solid").from("work_queue").update({
     status:policy.blocked?"blocked":policy.retry?"pending":"failed",
     last_error:msg,
     available_at:new Date(Date.now()+policy.delayMinutes*60000).toISOString(),
-    locked_at:null,locked_by:null,updated_at:new Date().toISOString()
+    locked_at:null,locked_by:null,
+    finished_at:policy.retry?null:failNow,
+    updated_at:failNow
    }).eq("id",job.id);
    results.push({ok:false,job_id:job.id,kind:job.kind,blocked:policy.blocked,retry:policy.retry,
     failure_class:policy.failureClass,transient:policy.transient,max_attempts:policy.maxAttempts,
     retry_after_minutes:policy.retry?policy.delayMinutes:null,error:msg});
    }
   }
-  return out({ok:true,batch_size:batchSize,processed:results.length,idle:results.length===0,results});
+  return out({ok:true,batch_size:batchSize,lane,processed:results.length,idle:results.length===0,results});
  }catch(e){
   console.error(e);
   return out({ok:false,error:String(e)},500);
