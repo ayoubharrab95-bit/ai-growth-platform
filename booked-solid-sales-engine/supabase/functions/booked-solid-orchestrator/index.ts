@@ -171,22 +171,42 @@ async function planCycle(body: any) {
   const { data: settings } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).single();
   if (!settings?.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
   const requestedCap=Math.max(1,Math.min(6,Number(body.limit||3)));
-  const [{count:dueWork},{count:runningWork}]=await Promise.all([
+  const [{count:dueWork},{count:runningWork},{count:resolveBacklog},{data:osmPressureSource}]=await Promise.all([
     db.schema("booked_solid").from("work_queue")
       .select("*",{count:"exact",head:true}).eq("status","pending").lte("available_at",new Date().toISOString()),
     db.schema("booked_solid").from("work_queue")
-      .select("*",{count:"exact",head:true}).eq("status","running")
+      .select("*",{count:"exact",head:true}).eq("status","running"),
+    db.schema("booked_solid").from("work_queue")
+      .select("*",{count:"exact",head:true}).eq("kind","resolve").in("status",["pending","running"]),
+    db.schema("booked_solid").from("source_catalog")
+      .select("metadata,lifecycle_state,enabled").eq("slug","openstreetmap_overpass").maybeSingle()
   ]);
   const dueNow=Number(dueWork||0);
   const runningNow=Number(runningWork||0);
-  if(dueNow>60||runningNow>20){
+  const resolveNow=Number(resolveBacklog||0);
+  const osmCooldownRaw=String(osmPressureSource?.metadata?.cooldown_until||"");
+  const osmCooldownMs=osmCooldownRaw?new Date(osmCooldownRaw).getTime():0;
+  const osmCooling=Number.isFinite(osmCooldownMs)&&osmCooldownMs>Date.now();
+  const pressureReason=dueNow>60||runningNow>20
+    ?"pipeline_backpressure"
+    :resolveNow>250
+      ?(osmCooling?"resolve_backlog_source_cooling":"resolve_backlog")
+      :null;
+  if(pressureReason){
     return json({
       ok:true,
       mode:"planner",
       queued:0,
       paused:true,
-      reason:"pipeline_backpressure",
-      backpressure:{due_now:dueNow,running:runningNow,resume_when:"due_now<=60 AND running<=20"},
+      reason:pressureReason,
+      backpressure:{
+        due_now:dueNow,
+        running:runningNow,
+        resolve_backlog:resolveNow,
+        osm_cooling:osmCooling,
+        osm_cooldown_until:osmCooldownRaw||null,
+        resume_when:"due_now<=60 AND running<=20 AND resolve_backlog<=250"
+      },
       email_gate:"blocked_until_email_configuration",
       discovery_preserved:true
     },200);
