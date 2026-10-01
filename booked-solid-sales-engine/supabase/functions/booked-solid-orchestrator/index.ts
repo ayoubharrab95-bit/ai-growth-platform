@@ -171,9 +171,26 @@ async function planCycle(body: any) {
   const { data: settings } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).single();
   if (!settings?.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
   const requestedCap=Math.max(1,Math.min(6,Number(body.limit||3)));
-  const {count:dueWork}=await db.schema("booked_solid").from("work_queue")
-    .select("*",{count:"exact",head:true}).eq("status","pending").lte("available_at",new Date().toISOString());
+  const [{count:dueWork},{count:runningWork}]=await Promise.all([
+    db.schema("booked_solid").from("work_queue")
+      .select("*",{count:"exact",head:true}).eq("status","pending").lte("available_at",new Date().toISOString()),
+    db.schema("booked_solid").from("work_queue")
+      .select("*",{count:"exact",head:true}).eq("status","running")
+  ]);
   const dueNow=Number(dueWork||0);
+  const runningNow=Number(runningWork||0);
+  if(dueNow>60||runningNow>20){
+    return json({
+      ok:true,
+      mode:"planner",
+      queued:0,
+      paused:true,
+      reason:"pipeline_backpressure",
+      backpressure:{due_now:dueNow,running:runningNow,resume_when:"due_now<=60 AND running<=20"},
+      email_gate:"blocked_until_email_configuration",
+      discovery_preserved:true
+    },200);
+  }
   const requestedLimit=dueNow>30?1:dueNow>15?2:requestedCap;
   const ranked = await chooseStrategies(100);
   const { data: marketRows } = await db.schema("booked_solid").from("market_catalog").select("*").in("lifecycle_state",["testing","active"]);
