@@ -86,26 +86,41 @@ async function chooseStrategies(limit = 50) {
 async function queueOneEnrichment(){
   const [{data:leads},{data:activeResearch}] = await Promise.all([
     db.schema("booked_solid").from("leads")
-      .select("id,company_id,strategy_id,score,status,companies!inner(id,enrichment_version,last_enriched_at)")
+      .select("id,company_id,strategy_id,score,status,companies!inner(id,enrichment_version,last_enriched_at,website_url,metadata)")
       .in("status",["qualified","candidate"])
       .order("score",{ascending:false})
-      .limit(200),
+      .limit(300),
     db.schema("booked_solid").from("work_queue")
       .select("payload")
       .eq("kind","research")
       .in("status",["pending","running"])
   ]);
   const active=new Set((activeResearch??[]).map((x:any)=>String(x.payload?.company_id||"")).filter(Boolean));
-  const pool=(leads??[]).filter((x:any)=>Number(x.companies?.enrichment_version??0)<1&&!active.has(String(x.company_id)));
+  const pool=(leads??[])
+    .filter((x:any)=>Number(x.companies?.enrichment_version??0)<2&&Boolean(x.companies?.website_url)&&!active.has(String(x.company_id)))
+    .sort((a:any,b:any)=>{
+      const rank=(x:any)=>{
+        const s=Number(x.score||0);
+        if(x.status==="candidate"&&s>=50&&s<65)return 300+s; // conversion frontier first
+        if(x.status==="qualified")return 200+s;              // improve decision-maker/message quality next
+        return 100+s;
+      };
+      return rank(b)-rank(a);
+    });
   const next=pool[0];if(!next)return null;
-  const priority=next.status==="qualified"?45+Math.min(5,Number(next.score||0)*0.05):25+Math.min(5,Number(next.score||0)*0.03);
+  const score=Number(next.score||0);
+  const priority=next.status==="candidate"&&score>=50&&score<65
+    ?58+Math.min(7,score*0.10)
+    :next.status==="qualified"
+      ?52+Math.min(6,score*0.07)
+      :35+Math.min(5,score*0.05);
   const {data,error}=await db.schema("booked_solid").from("work_queue").insert({
     kind:"research",priority,
-    payload:{company_id:next.company_id,strategy_id:next.strategy_id,reason:"incremental_enrichment_v1"},
+    payload:{company_id:next.company_id,strategy_id:next.strategy_id,reason:"website_intelligence_v2_incremental"},
     status:"pending",available_at:new Date().toISOString()
   }).select("id,priority,payload").single();
   if(error)throw error;
-  return {job_id:data.id,company_id:next.company_id,lead_id:next.id,lead_status:next.status,priority};
+  return {job_id:data.id,company_id:next.company_id,lead_id:next.id,lead_status:next.status,lead_score:score,priority,enrichment_target_version:2};
 }
 
 async function planCycle(body: any) {
