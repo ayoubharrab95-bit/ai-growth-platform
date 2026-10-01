@@ -156,7 +156,8 @@ function plausiblePersonName(name:string){
  const n=String(name||"").replace(/\s+/g," ").trim();
  const parts=n.split(" ").filter(Boolean);
  if(parts.length<2||parts.length>4||n.length<5||n.length>80)return false;
- if(/\b(company|construction|contracting|roofing|plumbing|electric|electrical|hvac|services|service|team|leadership|management|solutions|group|inc|llc|corp|department|office|meet|welcome|contact|about|story|history|values|mission)\b/i.test(n))return false;
+ if(/\b(company|construction|contracting|roofing|plumbing|electric|electrical|hvac|services|service|team|leadership|management|solutions|group|inc|llc|corp|department|office|meet|welcome|contact|about|story|history|values|mission|career|careers|growth|work|working|why|offer|ready|start|future|positions|benefits|culture|support|mentorship)\b/i.test(n))return false;
+ if(n===n.toUpperCase()&&/[A-Z]/.test(n))return false;
  return parts.every((x:string)=>/^[A-Z][A-Za-z'’.\-]+$/.test(x)||/^[A-Z]\.$/.test(x));
 }
 function extractWebsitePeople(pages:any[],domain:string){
@@ -174,7 +175,7 @@ function extractWebsitePeople(pages:any[],domain:string){
   const prev=found.get(key);
   if(!prev||confidence>prev.confidence||(!prev.email&&email))found.set(key,{...(prev??{}),...row,email:email??prev?.email??null,phone:row.phone??prev?.phone??null,phone_confidence:Math.max(Number(prev?.phone_confidence||0),Number(row.phone_confidence||0))});
  };
- const rolePart="Owner|Founder|Co-Founder|President|Chief Executive Officer|CEO|Vice President|VP|Director of Operations|Operations Director|Operations Manager|General Manager|Managing Partner|Principal|Estimating Manager|Preconstruction Manager|Project Executive|Project Manager|Office Manager";
+ const rolePart="Owner|Founder|Co-Founder|President|Chief Executive Officer|CEO|Executive Director|Vice President|VP|Director of Operations|Operations Director|Operations Manager|General Manager|Managing Partner|Principal|Estimating Manager|Preconstruction Manager|Project Executive|Project Manager|Office Manager";
  const namePart="([A-Z][A-Za-z'’.\\-]+(?:\\s+[A-Z][A-Za-z'’.\\-]+){1,3})";
  for(const pg of pages||[]){
   if(!pg)continue;
@@ -187,7 +188,7 @@ function extractWebsitePeople(pages:any[],domain:string){
    for(const v of Object.values(x))if(v&&typeof v==="object")walk(v);
   };
   for(const m of html.matchAll(/<script[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)){try{walk(JSON.parse(String(m[1]||"").trim()));}catch{}}
-  if(/about|team|leadership|management/i.test(String(pg.p||""))){
+  if(/about|team|leadership|management/i.test(String(pg.p||""))&&!/career|jobs?|employment/i.test(String(pg.p||""))){
    const headingRx=/<h[2-4][^>]*>([\s\S]*?)<\/h[2-4]>/gi;let hm:RegExpExecArray|null;
    while((hm=headingRx.exec(html))){
     const heading=clean(String(hm[1]||"")).replace(/\s+/g," ").trim();
@@ -924,6 +925,168 @@ async function research(job:any){
  return {pages,signals:types,triggers:triggers.map((x:any)=>({type:x.type,strength:x.strength})),emails:emails.size,phones:phones.size,decision_makers:websitePeople.length,website_profile:{services:websiteProfile.services,capabilities:websiteProfile.capabilities,hiring_roles:websiteProfile.hiring_roles},intelligence_version:2,supplemental_results:supplemental.length,gap_fill_used:missingName||missingContact||combined.length<500};
 }
 
+function extractHrefValues(html:string){
+ const out:string[]=[];const rx=/\bhref\s*=\s*["']([^"'#]+)["']/gi;let m:RegExpExecArray|null;
+ while((m=rx.exec(String(html||""))))out.push(String(m[1]||"").trim());
+ return out;
+}
+function extractMailtoEmails(html:string,domain:string){
+ const out=new Set<string>();
+ for(const href of extractHrefValues(html)){
+  if(!/^mailto:/i.test(href))continue;
+  const addr=decodeURIComponent(href.replace(/^mailto:/i,"").split("?")[0]||"").trim().toLowerCase();
+  for(const e of addr.split(/[;,]/).map(x=>x.trim()).filter(Boolean)){
+   if(!/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(e))continue;
+   const ed=e.split("@")[1]||"";
+   if(ed===domain||ed.endsWith("."+domain))out.add(e);
+  }
+ }
+ return [...out];
+}
+function extractContactFormUrl(html:string,pageUrl:string,root:URL){
+ const raw=String(html||"");
+ const pagePath=(()=>{try{return new URL(pageUrl).pathname}catch{return ""}})();
+ if(/<form\b/i.test(raw)&&/(contact|estimate|quote|schedule|book|request)/i.test(pagePath))return pageUrl;
+ const candidates:string[]=[];
+ const formRx=/<form[^>]*\baction\s*=\s*["']([^"']*)["'][^>]*>/gi;let fm:RegExpExecArray|null;
+ while((fm=formRx.exec(raw))){const x=String(fm[1]||"").trim();if(x)candidates.push(x);}
+ for(const href of extractHrefValues(raw))if(/contact|estimate|quote|schedule|book|request/i.test(href))candidates.push(href);
+ for(const x of candidates){
+  if(/wp-login|wp-admin|postpass|login|logout|password/i.test(x))continue;
+  try{const u=new URL(x,pageUrl);if(u.origin===root.origin&&/^https?:$/.test(u.protocol)&&/(contact|estimate|quote|schedule|book|request)/i.test(u.pathname+u.search))return u.toString();}catch{}
+ }
+ return null;
+}
+function vanityDigit(ch:string){const x=ch.toUpperCase();if(/[ABC]/.test(x))return "2";if(/[DEF]/.test(x))return "3";if(/[GHI]/.test(x))return "4";if(/[JKL]/.test(x))return "5";if(/[MNO]/.test(x))return "6";if(/[PQRS]/.test(x))return "7";if(/[TUV]/.test(x))return "8";if(/[WXYZ]/.test(x))return "9";return x;}
+function extractVanityPhones(text:string,sourceUrl:string){
+ const out:any[]=[];const seen=new Set<string>();
+ for(const m of String(text||"").match(/(?:\+?1[\s.()-]*)?(?:800|888|877|866|855|844|833|822)[\s.()-]*[0-9A-Z]{3}[\s.-]*[0-9A-Z]{4}/gi)??[]){
+  const raw=String(m),digits=raw.toUpperCase().replace(/[A-Z]/g,(x:string)=>vanityDigit(x)).replace(/\D/g,"");
+  const d=digits.length===11&&digits.startsWith("1")?digits.slice(1):digits;if(d.length!==10||seen.has(d))continue;seen.add(d);
+  out.push({phone:"+1"+d,phone_type:"company_public",phone_confidence:86,phone_source_url:sourceUrl});
+ }
+ return out;
+}
+function contactIntelUrlHint(value:string){
+ let s=String(value||"").toLowerCase();try{s=new URL(s,"https://example.invalid").pathname.toLowerCase()}catch{}
+ return /(?:^|[-_/])(team|staff|leadership|management|owner|founder|president|executive|director|meet)(?:[-_/]|$)/i.test(s)
+   || /(?:^|\/)(about|company|who-we-are|our-story|contact|contact-us)(?:\/|$)/i.test(s);
+}
+async function focusedContactIntelligence(company:any){
+ if(!company?.website_url)return {version:2,pages:0,people:[],emails:[],phones:[],contact_form_url:null};
+ let root:URL;try{root=new URL(company.website_url)}catch{return {version:2,pages:0,people:[],emails:[],phones:[],contact_form_url:null}}
+ const domain=String(company.canonical_domain||root.hostname.replace(/^www\./,"")).toLowerCase();
+ const candidates=new Set<string>();
+ const add=(x:string)=>{
+  try{const u=new URL(x,root);u.hash="";if(u.origin!==root.origin||!/^https?:$/.test(u.protocol))return;
+   if(/\.(?:pdf|jpg|jpeg|png|gif|svg|webp|zip|docx?|xlsx?)$/i.test(u.pathname))return;
+   candidates.add(u.toString());
+  }catch{}
+ };
+ for(const p of ["/","/about","/about-us","/team","/our-team","/leadership","/staff","/management","/who-we-are","/our-story","/contact","/contact-us"])add(p);
+ let rootHtml="";
+ try{
+  const r=await fetch(root.toString(),{redirect:"follow",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidContactIntelBot/2.0 (+https://www.bookedsolidcopy.com/)"}});
+  if(r.ok){const declared=Number(r.headers.get("content-length")||0);if(!declared||declared<=1500000)rootHtml=(await r.text()).slice(0,300000);}
+ }catch{}
+ for(const href of extractHrefValues(rootHtml)){
+  if(contactIntelUrlHint(href))add(href);
+ }
+ try{
+  const sitemapQueue:string[]=[new URL("/sitemap.xml",root).toString()];
+  const seenMaps=new Set<string>();
+  let mapsFetched=0;
+  while(sitemapQueue.length&&mapsFetched<4&&candidates.size<28){
+   const smUrl=sitemapQueue.shift()!;if(seenMaps.has(smUrl))continue;seenMaps.add(smUrl);mapsFetched++;
+   try{
+    const sr=await fetch(smUrl,{redirect:"follow",signal:AbortSignal.timeout(5000),headers:{"User-Agent":"BookedSolidContactIntelBot/2.0 (+https://www.bookedsolidcopy.com/)"}});
+    if(!sr.ok)continue;const xml=(await sr.text()).slice(0,800000);
+    for(const m of xml.matchAll(/<loc>\s*([^<]+)\s*<\/loc>/gi)){
+     const loc=String(m[1]||"").replace(/&amp;/g,"&").trim();
+     if(/sitemap.*\.xml(?:\?|$)/i.test(loc)){
+      try{const su=new URL(loc,root);if(su.origin===root.origin&&sitemapQueue.length<8)sitemapQueue.push(su.toString());}catch{}
+      continue;
+     }
+     if(contactIntelUrlHint(loc))add(loc);
+     if(candidates.size>=28)break;
+    }
+   }catch{}
+  }
+ }catch{}
+ const preferred=[...candidates].sort((a,b)=>{
+  const rank=(u:string)=>{
+   const s=(()=>{try{return new URL(u).pathname.toLowerCase()}catch{return String(u).toLowerCase()}})();
+   if(/(?:^|[-_/])(team|staff|leadership|management|owner|founder|president|executive|director|meet)(?:[-_/]|$)/i.test(s))return 0;
+   if(/(?:^|\/)(about|company|who-we-are|our-story)(?:\/|$)/i.test(s))return 1;
+   if(/(?:^|\/)(contact|contact-us)(?:\/|$)/i.test(s))return 2;
+   return 3;
+  };
+  return rank(a)-rank(b);
+ }).slice(0,10);
+ const fetchedPages=(await Promise.all(preferred.map(async url=>{try{
+  const r=await fetch(url,{redirect:"follow",signal:AbortSignal.timeout(6000),headers:{"User-Agent":"BookedSolidContactIntelBot/2.0 (+https://www.bookedsolidcopy.com/)"}});
+  if(!r.ok)return null;const declared=Number(r.headers.get("content-length")||0);if(Number.isFinite(declared)&&declared>1500000)return null;
+  const h=(await r.text()).slice(0,300000),visible=clean(h).slice(0,80000);
+  return {p:new URL(r.url||url).pathname,h,visible,url:r.url||url};
+ }catch{return null}}))).filter(Boolean) as any[];
+ const finalPageMap=new Map<string,any>();for(const pg of fetchedPages){const k=String(pg.url||"").replace(/\/$/,"");if(!finalPageMap.has(k))finalPageMap.set(k,pg);}
+ const pages=[...finalPageMap.values()].slice(0,10);
+ const people=extractWebsitePeople(pages,domain);
+ const emails=new Map<string,any>(),phones=new Map<string,any>();let formUrl:string|null=null;
+ for(const pg of pages){
+  const pageEmails=new Set<string>([
+   ...extractMailtoEmails(pg.h,domain),
+   ...(pg.visible.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[]).map((e:string)=>e.toLowerCase()).filter((e:string)=>{const ed=e.split("@")[1]||"";return ed===domain||ed.endsWith("."+domain)})
+  ]);
+  for(const email of pageEmails){
+   const prev=emails.get(email),kind=mailboxKind(email),confidence=kind==="direct"?92:kind==="generic"?84:45;
+   if(!prev||confidence>prev.confidence)emails.set(email,{email,confidence,source_url:pg.url,kind});
+  }
+  for(const ph of [...extractPhoneCandidates(pg.visible,pg.url,pg.p),...extractVanityPhones(pg.visible,pg.url)]){
+   const prev=phones.get(ph.phone);if(!prev||Number(ph.phone_confidence)>Number(prev.phone_confidence))phones.set(ph.phone,ph);
+  }
+  if(!formUrl)formUrl=extractContactFormUrl(pg.h,pg.url,root);
+ }
+ // Link only actually published direct emails to a person when the email pattern matches that public name.
+ for(const person of people){
+  if(person.email)continue;
+  const match=[...emails.values()].find((x:any)=>x.kind==="direct"&&emailMatchesName(x.email,person.full_name));
+  if(match)person.email=match.email;
+ }
+ return {version:2,pages:pages.length,people,emails:[...emails.values()],phones:[...phones.values()],contact_form_url:formUrl,urls:pages.map((p:any)=>p.url)};
+}
+async function persistFocusedContactIntelligence(company:any,intel:any,existingContacts:any[]){
+ const contacts=[...(existingContacts??[])];
+ for(const person of intel.people??[]){
+  let row=person.email?contacts.find((x:any)=>String(x.email||"").toLowerCase()===String(person.email).toLowerCase()):null;
+  if(!row)row=contacts.find((x:any)=>normalize(String(x.full_name||""))===normalize(String(person.full_name||"")));
+  const patch:any={full_name:person.full_name,role:person.role,source_url:person.source_url,status:"unverified",updated_at:new Date().toISOString()};
+  if(person.email){patch.email=String(person.email).toLowerCase();patch.email_confidence=Math.max(90,Number(row?.email_confidence||0));}
+  if(person.phone){patch.phone=person.phone;patch.phone_type="decision_maker_public";patch.phone_confidence=Math.max(85,Number(row?.phone_confidence||0));patch.phone_source_url=person.source_url;patch.phone_status="unverified";patch.sms_consent_status="unknown";patch.sms_eligible=false;patch.phone_last_verified_at=new Date().toISOString();}
+  if(row){await db.schema("booked_solid").from("contacts").update(patch).eq("id",row.id);Object.assign(row,patch);}
+  else{const {data:created,error}=await db.schema("booked_solid").from("contacts").insert({company_id:company.id,...patch}).select("*").single();if(!error&&created)contacts.push(created);}
+ }
+ for(const item of intel.emails??[]){
+  if(item.kind==="weak")continue;
+  let row=contacts.find((x:any)=>String(x.email||"").toLowerCase()===String(item.email).toLowerCase());
+  if(row){const patch={email_confidence:Math.max(Number(row.email_confidence||0),Number(item.confidence||0)),source_url:row.source_url||item.source_url,status:row.status==="invalid"?"invalid":"unverified",updated_at:new Date().toISOString()};await db.schema("booked_solid").from("contacts").update(patch).eq("id",row.id);Object.assign(row,patch);}
+  else{const {data:created,error}=await db.schema("booked_solid").from("contacts").insert({company_id:company.id,email:item.email,email_confidence:item.confidence,source_url:item.source_url,status:"unverified"}).select("*").single();if(!error&&created)contacts.push(created);}
+ }
+ for(const ph of intel.phones??[]){
+  let row=contacts.find((x:any)=>x.phone===ph.phone);
+  if(row)continue;
+  const {data:created,error}=await db.schema("booked_solid").from("contacts").insert({company_id:company.id,phone:ph.phone,phone_type:ph.phone_type||"company_public",phone_confidence:ph.phone_confidence||75,phone_source_url:ph.phone_source_url||company.website_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),status:"unverified"}).select("*").single();
+  if(!error&&created)contacts.push(created);
+ }
+ await db.schema("booked_solid").from("companies").update({metadata:{...(company.metadata??{}),contact_intelligence_version:2,contact_intelligence_last_run_at:new Date().toISOString(),contact_intelligence:{pages:intel.pages,public_emails:(intel.emails??[]).length,decision_makers:(intel.people??[]).map((p:any)=>({name:p.full_name,role:p.role,email:Boolean(p.email),phone:Boolean(p.phone),source_url:p.source_url})),contact_form_url:intel.contact_form_url,urls:intel.urls??[]}}}).eq("id",company.id);
+ const claim=(intel.people??[]).length?("Focused contact intelligence found "+(intel.people??[]).length+" public decision-maker candidate(s)."):(intel.emails??[]).length?("Focused contact intelligence found "+(intel.emails??[]).length+" public company email route(s)."):"Focused contact intelligence completed without a verified named contact.";
+ const {data:old}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",company.id).eq("evidence_type","intel_contact_route").eq("source_url",company.website_url).limit(1);
+ const meta={intelligence_version:2,pages:intel.pages,decision_makers:(intel.people??[]).length,public_emails:(intel.emails??[]).length,contact_form_url:intel.contact_form_url,qualification_neutral:true};
+ if((old??[]).length)await db.schema("booked_solid").from("evidence").update({claim,snippet:JSON.stringify(meta).slice(0,1200),confidence:90,observed_at:new Date().toISOString(),metadata:meta}).eq("id",old![0].id);
+ else await db.schema("booked_solid").from("evidence").insert({company_id:company.id,evidence_type:"intel_contact_route",claim,snippet:JSON.stringify(meta).slice(0,1200),source_url:company.website_url,confidence:90,metadata:meta});
+ return contacts;
+}
+
 async function contactResolve(job:any){
  const leadId=job.payload?.lead_id;if(!leadId)throw new Error("contact_resolve_lead_id_required");
  const {data:lead,error:le}=await db.schema("booked_solid").from("leads").select("*,companies(*)").eq("id",leadId).single();if(le)throw le;
@@ -931,6 +1094,10 @@ async function contactResolve(job:any){
  const company=lead.companies;
  const {data:raw,error:ce}=await db.schema("booked_solid").from("contacts").select("*").eq("company_id",company.id).neq("status","suppressed");if(ce)throw ce;
  let contacts=(raw??[]).filter((x:any)=>x.status!=="invalid");
+ let contactIntel:any=null;
+ if(Number(company.metadata?.contact_intelligence_version||0)<2||job.payload?.force_contact_intelligence_v2===true){
+  try{contactIntel=await focusedContactIntelligence(company);contacts=(await persistFocusedContactIntelligence(company,contactIntel,contacts)).filter((x:any)=>x.status!=="invalid"&&x.status!=="suppressed");}catch(e){contactIntel={version:2,error:e instanceof Error?e.message:String(e)};}
+ }
  const named=[...contacts].filter((x:any)=>x.full_name).sort((a:any,b:any)=>(decisionRoleScore(b.role)-decisionRoleScore(a.role))||(contactResolutionScore(b)-contactResolutionScore(a)));
  const decisionMakers=named.filter((x:any)=>decisionRoleScore(x.role)>0);
  let decision=decisionMakers[0]??null;
@@ -991,7 +1158,12 @@ async function contactResolve(job:any){
  const phoneContacts=contacts.filter((x:any)=>x.phone&&x.phone_status!=="invalid");
  const decisionPhone=phoneContacts.filter((x:any)=>x.full_name&&decisionRoleScore(x.role)>0&&x.phone_type==="decision_maker_public").sort((a:any,b:any)=>Number(b.phone_confidence||0)-Number(a.phone_confidence||0))[0];
  const chosenPhone=decisionPhone??(chosen?.phone?chosen:phoneContacts.sort((a:any,b:any)=>Number(b.phone_confidence||0)-Number(a.phone_confidence||0))[0]??null);
- const state=chosen?"ready":weakOnly?"weak_only":"contact_required";
+ const publicForm=contactIntel?.contact_form_url??company.metadata?.contact_intelligence?.contact_form_url??null;
+ if(!chosen&&decisionPhone){contactClass="decision_maker_phone";score=Math.max(score,60);}
+ else if(!chosen&&decision&&publicForm){contactClass="decision_maker_contact_form";score=Math.max(score,45);}
+ else if(!chosen&&publicForm){contactClass="public_contact_form";score=Math.max(score,30);}
+ else if(!chosen&&chosenPhone){contactClass="company_phone";score=Math.max(score,25);}
+ const state=chosen?"ready":decisionPhone?"phone_ready":publicForm?"contact_form_available":chosenPhone?"phone_available":weakOnly?"weak_only":"contact_required";
  const retryCount=Number(job.payload?.contact_retry??0);
  const nextRetryAt=!chosen&&retryCount<3?new Date(Date.now()+72*3600000).toISOString():null;
  const phoneScore=chosenPhone?(chosenPhone.phone_type==="decision_maker_public"?100:60):0;
@@ -999,11 +1171,15 @@ async function contactResolve(job:any){
  const updatedPriorityBand=Number(lead.trigger_score||0)>=35&&updatedOpportunity>=80?"hot":updatedOpportunity>=70?"high":Number(lead.trigger_score||0)>=20?"signal":"standard";
  const resolution={
    state,contact_class:contactClass,score,retry_count:retryCount,next_retry_at:nextRetryAt,
+   contact_intelligence_version:2,
+   contact_form_url:publicForm,
+   pages_scanned:Number(contactIntel?.pages??company.metadata?.contact_intelligence?.pages??0),
    recipient_email:chosen?.email?String(chosen.email).toLowerCase():null,
-   recipient_name:namedContact?.full_name||null,
-   recipient_role:namedContact?.role||null,
-   contact_id:namedContact?.id||chosen?.id||null,
+   recipient_name:namedContact?.full_name||decision?.full_name||null,
+   recipient_role:namedContact?.role||decision?.role||null,
+   contact_id:chosen?.id||decision?.id||chosenPhone?.id||null,
    email_contact_id:chosen?.id||null,
+   decision_maker_contact_id:decision?.id||null,
    email_kind:chosen?.email?mailboxKind(chosen.email):null,
    phone:chosenPhone?.phone||null,
    phone_type:chosenPhone?.phone_type||null,
@@ -1022,7 +1198,10 @@ async function contactResolve(job:any){
 
  if(!chosen){
    await db.schema("booked_solid").from("outreach_queue").update({status:"cancelled",failure_reason:weakOnly?"Contact resolution: only weak-function inboxes available.":"Contact resolution: no usable email found."}).eq("lead_id",lead.id).in("status",["blocked_email_not_configured","ready"]);
-   if(nextRetryAt)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:Math.max(30,Number(lead.score||0)-15),payload:{lead_id:lead.id,company_id:company.id,contact_retry:retryCount+1,reason:"scheduled_contact_retry"},status:"pending",available_at:nextRetryAt});
+   if(nextRetryAt){
+    const {data:futureRetry}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","contact").eq("status","pending").contains("payload",{lead_id:lead.id}).limit(1);
+    if(!(futureRetry??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:Math.max(30,Number(lead.score||0)-15),payload:{lead_id:lead.id,company_id:company.id,contact_retry:retryCount+1,reason:"scheduled_contact_retry"},status:"pending",available_at:nextRetryAt});
+   }
    return {lead_id:lead.id,company:company.name,...resolution,queued_message:false,retry_scheduled:Boolean(nextRetryAt)};
  }
  const {data:mq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","message").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
