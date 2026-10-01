@@ -129,3 +129,55 @@ begin
  return new;
 end
 $function$;
+
+
+create or replace function solidos_control.system_snapshot()
+returns jsonb
+language sql
+stable
+security invoker
+set search_path=''
+as $function$
+select jsonb_build_object(
+  'system','SolidOS','snapshot_at',now(),
+  'mode',(select mode from solidos_control.settings where id=true),
+  'core',jsonb_build_object(
+    'companies',(select count(*) from booked_solid.companies),
+    'leads',(select count(*) from booked_solid.leads),
+    'qualified',(select count(*) from booked_solid.leads where lower(status)='qualified'),
+    'candidates',(select count(*) from booked_solid.leads where lower(status)='candidate'),
+    'due_now',(select count(*) from booked_solid.work_queue where status='pending' and available_at<=now()),
+    'scheduled_future',(select count(*) from booked_solid.work_queue where status='pending' and available_at>now()),
+    'running',(select count(*) from booked_solid.work_queue where status='running'),
+    'failed_terminal',(select count(*) from booked_solid.work_queue where status='failed'),
+    'dead_letter_unresolved',(select count(*) from solidos_control.dead_letter where recovery_status='UNRESOLVED')
+  ),
+  'intel',jsonb_build_object(
+    'dirty_backlog',(select count(*) from solidos_control.dirty_companies),
+    'dirty_oldest_seconds',coalesce((select extract(epoch from(now()-min(first_dirty_at)))::bigint from solidos_control.dirty_companies),0),
+    'assets',(select count(*) from commercial_intel.company_assets),
+    'safe_assets',(select count(*) from commercial_intel.company_assets where commercial_status='COMMERCIAL_SAFE'),
+    'review_assets',(select count(*) from commercial_intel.company_assets where commercial_status='REVIEW_REQUIRED'),
+    'signals',(select count(*) from commercial_intel.business_signals where active),
+    'exportable_memberships',(select count(*) from commercial_intel.product_memberships where exportable)
+  ),
+  'sources',jsonb_build_object(
+    'enabled',(select count(*) from booked_solid.source_catalog where enabled),
+    'healthy',(select count(*) from solidos_control.source_health where enabled and health_state='HEALTHY'),
+    'degraded',(select count(*) from solidos_control.source_health where enabled and health_state='DEGRADED'),
+    'cooling',(select count(*) from solidos_control.source_health where enabled and health_state='COOLING')
+  ),
+  'sheet_engine',jsonb_build_object(
+    'pending_requests',(select count(*) from solidos_control.sheet_sync_requests where status='PENDING'),
+    'blocked_not_configured',(select count(*) from solidos_control.sheet_sync_requests where status='BLOCKED_NOT_CONFIGURED'),
+    'targets',(select count(*) from commercial_intel.sheet_targets where sync_enabled),
+    'last_success',(select max(last_sync_at) from commercial_intel.sheet_targets where upper(coalesce(last_sync_status,''))='SUCCESS')
+  ),
+  'safety',jsonb_build_object(
+    'email_enabled',(select email_enabled from booked_solid.runtime_settings where id=true),
+    'sms_enabled',(select sms_enabled from booked_solid.runtime_settings where id=true),
+    'buyer_outreach_enabled',(select buyer_outreach_enabled from commercial_intel.settings where id=true),
+    'personal_pii_export',(select allow_personal_pii_export from commercial_intel.settings where id=true)
+  )
+);
+$function$;
