@@ -170,7 +170,11 @@ async function queueContactIntelligenceV2(limit=2){
 async function planCycle(body: any) {
   const { data: settings } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).single();
   if (!settings?.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
-  const requestedLimit = 1;
+  const requestedCap=Math.max(1,Math.min(6,Number(body.limit||3)));
+  const {count:dueWork}=await db.schema("booked_solid").from("work_queue")
+    .select("*",{count:"exact",head:true}).eq("status","pending").lte("available_at",new Date().toISOString());
+  const dueNow=Number(dueWork||0);
+  const requestedLimit=dueNow>30?1:dueNow>15?2:requestedCap;
   const ranked = await chooseStrategies(100);
   const { data: marketRows } = await db.schema("booked_solid").from("market_catalog").select("*").in("lifecycle_state",["testing","active"]);
   const { data: activeDiscover } = await db.schema("booked_solid").from("work_queue").select("payload,status").eq("kind","discover").in("status",["pending","running"]);
@@ -198,7 +202,8 @@ async function planCycle(body: any) {
   const strategies = selectionPool.slice(0, requestedLimit).map((s:any)=>({...s,target_location:marketFor(s,marketRows??[])}));
   const { data: allEnabledSources } = await db.schema("booked_solid").from("source_catalog").select("*").eq("enabled",true);
   const coolingSources=(allEnabledSources??[]).filter((x:any)=>sourceCooling(x));
-  const sources=(allEnabledSources??[]).filter((x:any)=>!sourceCooling(x));
+  const degradedSources=(allEnabledSources??[]).filter((x:any)=>!sourceCooling(x)&&(Number(x.consecutive_errors||0)>=4||String(x.metadata?.state||"")==="degraded"));
+  const sources=(allEnabledSources??[]).filter((x:any)=>!sourceCooling(x)&&Number(x.consecutive_errors||0)<4&&String(x.metadata?.state||"")!=="degraded");
   const sourceBySlug=new Map((sources??[]).map((x:any)=>[x.slug,x]));
   const osmSource=sourceBySlug.get("openstreetmap_overpass");
   const nrcaSource=sourceBySlug.get("nrca_official");
@@ -213,7 +218,13 @@ async function planCycle(body: any) {
   const philadelphiaTradeLicenseSource=sourceBySlug.get("philadelphia_trade_licenses");
   const denverPermitSource=sourceBySlug.get("denver_commercial_permits");
   const citySources=[chicagoPermitSource,nycPermitSource,austinPermitSource,seattlePermitSource,bostonPermitSource,sfPermitSource,philadelphiaPermitSource,philadelphiaTradeLicenseSource,denverPermitSource].filter(Boolean);
-  const autoActiveSources=(sources??[]).filter((x:any)=>["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||""))&&x.lifecycle_state==="active").sort((a:any,b:any)=>(Number(b.quality_score||50)+Number(b.exploration_weight||1)*8)-(Number(a.quality_score||50)+Number(a.exploration_weight||1)*8));
+  const autoActiveSources=(sources??[])
+    .filter((x:any)=>["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||""))&&["active","canary"].includes(String(x.lifecycle_state||"")))
+    .sort((a:any,b:any)=>{
+      const life=(x:any)=>x.lifecycle_state==="active"?100:0;
+      return (life(b)+Number(b.quality_score||50)+Number(b.exploration_weight||1)*8)
+            -(life(a)+Number(a.quality_score||50)+Number(a.exploration_weight||1)*8);
+    });
   const osmTrades=new Set(["Roofing","Commercial Roofing","HVAC","Commercial HVAC","Plumbing","Electrical","Painting","Flooring","Landscaping","General Contractor","Commercial Contractor","Construction","Windows","Deck Builder","Deck Patio","Cabinet","Remodeling","Bathroom Remodeling","Kitchen Remodeling","Kitchen Bath Remodeling","Home Builder","Custom Home Builder","Siding","Concrete","Mixed","Property Operations"]);
   const discoveryCapable=(source:any,trade:string,market:string)=>{
     if(!source)return false;
@@ -232,12 +243,22 @@ async function planCycle(body: any) {
   };
   const chooseBaseSource=(s:any)=>{
     const trade=String(s.trade||"Mixed"),market=String(s.target_location||"US");
+    const useCount=Number(s.uses_count||0);
     if(discoveryCapable(osmSource,trade,market))return osmSource;
     const city=citySources.find((x:any)=>discoveryCapable(x,trade,market));if(city)return city;
-    const generic=autoActiveSources.find((x:any)=>discoveryCapable(x,trade,market));if(generic)return generic;
+    const generics=autoActiveSources.filter((x:any)=>discoveryCapable(x,trade,market));
+    if(generics.length)return generics[hashText(String(s.slug)+":"+useCount)%generics.length];
     if(discoveryCapable(usaSpendingSource,trade,market))return usaSpendingSource;
     if(discoveryCapable(nrcaSource,trade,market))return nrcaSource;
-    return null;
+
+    // Source-backed market fallback: keep discovery moving when the strategy's
+    // preferred market has no healthy free source. The job market is replaced
+    // below by the selected source's authoritative market hint/market.
+    const fallbackGenerics=autoActiveSources.filter((x:any)=>Boolean(x?.metadata?.market_hint||x?.metadata?.market));
+    if(fallbackGenerics.length)return fallbackGenerics[hashText(String(s.slug)+":fallback:"+useCount)%fallbackGenerics.length];
+    const fallbackCities=citySources.filter((x:any)=>Boolean(x?.metadata?.market_hint||x?.metadata?.market));
+    if(fallbackCities.length)return fallbackCities[hashText(String(s.slug)+":city:"+useCount)%fallbackCities.length];
+    return autoActiveSources.length?autoActiveSources[hashText(String(s.slug)+":canary:"+useCount)%autoActiveSources.length]:null;
   };
   if (!strategies.length) {
     return json({ ok: true, paused: true, reason: "no_strategy_available" }, 200);
@@ -293,6 +314,7 @@ async function planCycle(body: any) {
       source_health:{
         healthy_enabled_sources:sources.length,
         cooling_enabled_sources:coolingSources.length,
+        degraded_enabled_sources:degradedSources.length,
         cooling_sources:coolingSources.slice(0,8).map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
       },
       skipped_strategies:strategies.map((s:any)=>({slug:s.slug,trade:s.trade,market:s.target_location}))
@@ -331,6 +353,7 @@ async function planCycle(body: any) {
     source_health: {
       healthy_enabled_sources: sources.length,
       cooling_enabled_sources: coolingSources.length,
+      degraded_enabled_sources: degradedSources.length,
       selected_source: queued?.[0]?.payload?.source_slug??null,
       cooling_sources: coolingSources.slice(0,8).map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
     },
