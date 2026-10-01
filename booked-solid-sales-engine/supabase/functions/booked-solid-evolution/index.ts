@@ -15,12 +15,26 @@ const HUNT_QUERIES=[
  "building permits contractor",
  "construction permits contractor company",
  "contractor licenses active",
+ "state contractor license registry",
+ "general contractor licenses active",
+ "commercial contractor licenses",
+ "residential contractor licenses",
+ "building contractor registrations",
  "electrical contractor licenses",
+ "electrical permits contractor",
  "plumbing contractor licenses",
+ "plumbing permits contractor",
  "hvac mechanical permits contractor",
+ "mechanical contractor licenses",
+ "mechanical permits contractor",
  "roofing permits contractor",
+ "roofing contractor licenses",
  "home improvement contractor licenses",
+ "home builder licenses registrations",
  "commercial construction permits contractor",
+ "building permit contractor name",
+ "painting contractor licenses",
+ "landscaping contractor licenses",
  "property management licenses"
 ];
 
@@ -295,7 +309,13 @@ const GENES=[
  {k:"multi-crew-scale",intent:"scale",q:"{trade} {location} multiple crews estimating workflow",offer:"automation"},
  {k:"service-contracts",intent:"recurring_contracts",q:"{trade} {location} service contracts quoting",offer:"automation"},
  {k:"change-order-pressure",intent:"change_orders",q:"{trade} {location} change order approval workflow",offer:"penmark"},
- {k:"quickbooks-workflow",intent:"workflow_complexity",q:"{trade} {location} QuickBooks estimates workflow",offer:"automation"}
+ {k:"quickbooks-workflow",intent:"workflow_complexity",q:"{trade} {location} QuickBooks estimates workflow",offer:"automation"},
+ {k:"hiring-estimator",intent:"capacity_signal",q:"{trade} {location} hiring estimator preconstruction project manager",offer:"custom_estimator"},
+ {k:"permit-activity",intent:"recent_project_activity",q:"{trade} {location} recent permits contractor active projects",offer:"custom_estimator"},
+ {k:"multi-location-growth",intent:"multi_location_growth",q:"{trade} {location} multiple locations branches service areas",offer:"automation"},
+ {k:"service-area-expansion",intent:"market_expansion",q:"{trade} {location} expanding service area new location",offer:"automation"},
+ {k:"commercial-maintenance",intent:"commercial_recurring",q:"{trade} {location} commercial maintenance service agreement contract",offer:"automation"},
+ {k:"field-quote-speed",intent:"field_quote_speed",q:"{trade} {location} same day estimate onsite quote fast proposal",offer:"custom_estimator"}
 ];
 async function evolveStrategies(maxNew=2,maxEnabled=180){
  const {data:all}=await db.schema("booked_solid").from("search_strategies").select("*").eq("enabled",true).order("performance_score",{ascending:false}).limit(Math.max(200,Number(maxEnabled||180)+20));
