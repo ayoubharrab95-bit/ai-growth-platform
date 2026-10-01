@@ -55,10 +55,11 @@ async function sheetMetadata(id:string,token:string){
   return await r.json();
 }
 function sheetIdMap(meta:any){
-  const m:any={__rows:{}};
+  const m:any={__rows:{},__cols:{}};
   for(const s of meta.sheets||[]){
     m[s.properties.title]=s.properties.sheetId;
     m.__rows[s.properties.title]=Number(s.properties?.gridProperties?.rowCount||0);
+    m.__cols[s.properties.title]=Number(s.properties?.gridProperties?.columnCount||0);
   }
   return m;
 }
@@ -94,6 +95,37 @@ async function readValues(id:string,range:string,token:string){
   const r=await fetch("https://sheets.googleapis.com/v4/spreadsheets/"+id+"/values/"+encodeURIComponent(range)+"?majorDimension=ROWS",{headers:{Authorization:"Bearer "+token}});
   if(!r.ok)throw new Error("sheet_read_"+r.status+":"+await r.text());
   return await r.json();
+}
+async function ensureTabCapacity(id:string,sm:any,name:string,requiredRows:number,requiredCols:number,token:string){
+  if(sm[name]===undefined)throw new Error("missing_tab:"+name);
+  const currentRows=Number(sm.__rows?.[name]||0);
+  const currentCols=Number(sm.__cols?.[name]||0);
+  const requests:any[]=[];
+  if(requiredRows>currentRows){
+    requests.push({updateSheetProperties:{properties:{sheetId:sm[name],gridProperties:{rowCount:requiredRows}},fields:"gridProperties.rowCount"}});
+    sm.__rows[name]=requiredRows;
+  }
+  if(requiredCols>currentCols){
+    requests.push({updateSheetProperties:{properties:{sheetId:sm[name],gridProperties:{columnCount:requiredCols}},fields:"gridProperties.columnCount"}});
+    sm.__cols[name]=requiredCols;
+  }
+  if(requests.length)await batchUpdate(id,requests,token);
+}
+async function writeAnyTab(id:string,sm:any,name:string,rows:any[][],token:string,minRows:number,maxCols:number){
+  if(sm[name]===undefined)throw new Error("missing_tab:"+name);
+  const currentRows=Number(sm.__rows?.[name]||0);
+  const requiredRows=Math.max(minRows,rows.length+50,currentRows);
+  await ensureTabCapacity(id,sm,name,requiredRows,maxCols,token);
+  await batchUpdate(id,updateRows(sm[name],rows,maxCols,requiredRows),token);
+}
+async function verifyHeaderAndCount(id:string,tab:string,expectedHeader:string,expectedRows:number,token:string){
+  const first=await readValues(id,tab+"!A1:A",token);
+  const vals=first.values||[];
+  const header=String(vals?.[0]?.[0]||"");
+  const actualRows=Math.max(0,vals.length-1);
+  if(header!==expectedHeader)throw new Error("verify_header:"+tab+":"+header+" expected "+expectedHeader);
+  if(actualRows!==expectedRows)throw new Error("verify_rows:"+tab+":"+actualRows+" expected "+expectedRows);
+  return {tab,actualRows,header};
 }
 function jsonSafe(v:any){
   if(v===null||v===undefined)return "";
@@ -182,12 +214,10 @@ async function writeProduct(targetKey:string,product:any,rows:any[],dictRows:any
     "OVERVIEW":built.overview,"SAFE DATA":built.safeData,"REVIEW QUEUE":built.reviewData,
     "SIGNALS":built.signals,"DATA DICTIONARY":dictRows,"VERSION LOG":versionRows
   };
-  const reqs:any[]=[];
   for(const [name,data] of Object.entries(tabs)){
     if(sm[name]===undefined)throw new Error(targetKey+":missing_tab:"+name);
-    reqs.push(...updateRows(sm[name],data as any[][],26,1000));
+    await writeAnyTab(id,sm,name,data as any[][],token,1000,26);
   }
-  await batchUpdate(id,reqs,token);
   return {id,title:meta.properties?.title,safe:built.safeData.length-1,review:built.reviewData.length-1};
 }
 async function writeMaster(payload:any,token:string){
@@ -206,18 +236,47 @@ async function writeMaster(payload:any,token:string){
   const audrows=[["Event At","Actor","Action","Entity Type","Entity ID","Reason"],...audit.slice(0,500).map((a:any)=>[a.event_at,a.actor,a.action,a.entity_type,a.entity_id||"",a.reason||""])];
   const sys=[["Setting","Value"],["Strict Compliance","ON"],["Automatic Rights Promotion","OFF"],["Buyer Hunting","OFF"],["Buyer Outreach","OFF"],["Personal PII Export","OFF"],["Cycle ID",manifest.cycle_id],["Snapshot At",manifest.snapshot_at],["Writer","SolidOS Native Sheets"]];
   const tabs:any={"COMMAND CENTER":command,"PRODUCTS":prows,"AGENTS":arows,"RIGHTS REVIEW":rrows,"FIELD SAFETY":frows,"BUYERS":brows,"RUNS":runrows,"AUDIT":audrows,"SYSTEM":sys};
-  const reqs:any[]=[]; for(const [name,data] of Object.entries(tabs)){if(sm[name]===undefined)throw new Error("MASTER:missing_tab:"+name);reqs.push(...updateRows(sm[name],data as any[][],26,1000));}
-  await batchUpdate(id,reqs,token);
-  return {id,title:meta.properties?.title};
+  for(const [name,data] of Object.entries(tabs)){
+    if(sm[name]===undefined)throw new Error("MASTER:missing_tab:"+name);
+    await writeAnyTab(id,sm,name,data as any[][],token,1000,26);
+  }
+  const cmdCheck=await readValues(id,"COMMAND CENTER!A1:B14",token);
+  if(String(cmdCheck.values?.[0]?.[0]||"")!=="Metric")throw new Error("MASTER:verify_header:COMMAND CENTER");
+  if(String(cmdCheck.values?.[1]?.[0]||"")!=="Cycle ID")throw new Error("MASTER:verify_cycle_row");
+
+  const masterVerify:any[]=[];
+  masterVerify.push(await verifyHeaderAndCount(id,"PRODUCTS","Slug",products.length,token));
+  masterVerify.push(await verifyHeaderAndCount(id,"AGENTS","Slug",agents.length,token));
+  masterVerify.push(await verifyHeaderAndCount(id,"RIGHTS REVIEW","Source",rights.length,token));
+  masterVerify.push(await verifyHeaderAndCount(id,"FIELD SAFETY","Field Key",fields.length,token));
+  masterVerify.push(await verifyHeaderAndCount(id,"BUYERS","Company",buyers.length,token));
+  masterVerify.push(await verifyHeaderAndCount(id,"RUNS","Agent",Math.min(500,runs.length),token));
+  masterVerify.push(await verifyHeaderAndCount(id,"AUDIT","Event At",Math.min(500,audit.length),token));
+
+  const sysCheck=await readValues(id,"SYSTEM!A1:B9",token);
+  if(String(sysCheck.values?.[0]?.[0]||"")!=="Setting"||String(sysCheck.values?.[0]?.[1]||"")!=="Value")throw new Error("MASTER:verify_system_header");
+
+  return {id,title:meta.properties?.title,verified_tabs:9,verification:masterVerify};
 }
 async function verifyProductSheet(targetKey:string,expectedSafe:number,expectedReview:number,token:string){
   const id=TARGETS[targetKey].id;
-  const safe=await readValues(id,"SAFE DATA!A:A",token);
-  const review=await readValues(id,"REVIEW QUEUE!A:A",token);
+  const safe=await readValues(id,"SAFE DATA!A1:R",token);
+  const review=await readValues(id,"REVIEW QUEUE!A1:L",token);
+  const overview=await readValues(id,"OVERVIEW!A1:B20",token);
+  const signals=await readValues(id,"SIGNALS!A1:H",token);
+  const dict=await readValues(id,"DATA DICTIONARY!A1:F",token);
+  const version=await readValues(id,"VERSION LOG!A1:H",token);
+
   const actualSafe=Math.max(0,(safe.values||[]).length-1);
   const actualReview=Math.max(0,(review.values||[]).length-1);
+  if(String(safe.values?.[0]?.[0]||"")!=="Company"||String(safe.values?.[0]?.[17]||"")!=="Commercial Status")throw new Error(targetKey+":verify_safe_header");
+  if(String(review.values?.[0]?.[0]||"")!=="Company"||String(review.values?.[0]?.[11]||"")!=="Match Reasons")throw new Error(targetKey+":verify_review_header");
+  if(String(overview.values?.[0]?.[0]||"")!=="Metric"||String(overview.values?.[0]?.[1]||"")!=="Value")throw new Error(targetKey+":verify_overview_header");
+  if(String(signals.values?.[0]?.[0]||"")!=="Signal Type")throw new Error(targetKey+":verify_signals_header");
+  if(String(dict.values?.[0]?.[0]||"")!=="Field Key")throw new Error(targetKey+":verify_dictionary_header");
+  if(String(version.values?.[0]?.[0]||"")!=="Version")throw new Error(targetKey+":verify_version_header");
   if(actualSafe!==expectedSafe||actualReview!==expectedReview)throw new Error(targetKey+":verify_counts:"+actualSafe+"/"+actualReview+" expected "+expectedSafe+"/"+expectedReview);
-  return {actualSafe,actualReview};
+  return {actualSafe,actualReview,verified_tabs:6};
 }
 async function commercialSync(token:string){
   const {data:payload,error:prepErr}=await db.rpc("solidos_prepare_commercial_sheet_sync");
@@ -257,7 +316,7 @@ async function commercialSync(token:string){
       const slug=TARGETS[key].slug, product=bySlug[slug];
       const vers=versions.filter((v:any)=>v.product_id===product.id).sort((a:any,b:any)=>Number(b.version_no)-Number(a.version_no)).slice(0,20);
       const meta=await sheetMetadata(TARGETS[key].id,token); const sm=sheetIdMap(meta);
-      await batchUpdate(TARGETS[key].id,updateRows(sm["VERSION LOG"],[["Version","Snapshot At","Eligible Records","Safe Records","Review Records","Schema Version","Checksum","Status"],...vers.map((v:any)=>[v.version_no,v.snapshot_at,v.record_count,v.safe_record_count,v.review_record_count,v.schema_version,v.checksum||"",v.status])],26,1000),token);
+      await writeAnyTab(TARGETS[key].id,sm,"VERSION LOG",[["Version","Snapshot At","Eligible Records","Safe Records","Review Records","Schema Version","Checksum","Status"],...vers.map((v:any)=>[v.version_no,v.snapshot_at,v.record_count,v.safe_record_count,v.review_record_count,v.schema_version,v.checksum||"",v.status])],token,1000,26);
     }
 
     return {ok:true,cycle_id:cycleId,snapshot_at:snapshotAt,results};
@@ -287,18 +346,7 @@ function fmtPri(p:any){return String(p||"standard").toUpperCase();}
 function sortLeads(a:any,b:any){return priRank(b.priority_band)-priRank(a.priority_band)||(Number(b.opportunity_score)||0)-(Number(a.opportunity_score)||0);}
 async function writeTab(id:string,sm:any,name:string,rows:any[][],token:string,maxRows:number,maxCols:number){
   if(sm[name]===undefined)throw new Error("CORE:missing_tab:"+name);
-  const currentRows=Number(sm.__rows?.[name]||0);
-  const requiredRows=Math.max(maxRows,rows.length+50,currentRows);
-  const requests:any[]=[];
-  if(currentRows>0&&requiredRows>currentRows){
-    requests.push({updateSheetProperties:{
-      properties:{sheetId:sm[name],gridProperties:{rowCount:requiredRows}},
-      fields:"gridProperties.rowCount"
-    }});
-    sm.__rows[name]=requiredRows;
-  }
-  requests.push(...updateRows(sm[name],rows,maxCols,requiredRows));
-  await batchUpdate(id,requests,token);
+  await writeAnyTab(id,sm,name,rows,token,maxRows,maxCols);
 }
 async function coreSync(token:string){
   const id=TARGETS.CORE_CRM.id;
@@ -344,7 +392,15 @@ async function coreSync(token:string){
   }
 
   // Preserve Courtney's manual workflow columns by stable Lead ID.
-  const oldAQ=await readValues(id,"ACTION QUEUE!A2:Q500",token);
+  // Fail safely if the ACTION QUEUE column schema was manually changed.
+  const expectedAQHeader=["Company","Priority","Opportunity","Trade","Decision Maker / Contact","Role","Email","Phone","Why Now","Offer","Action","Review Status","Owner","Next Follow-up","Courtney Notes","Lead ID","Company ID"];
+  const aqHeaderRead=await readValues(id,"ACTION QUEUE!A1:Q1",token);
+  const aqHeader=(aqHeaderRead.values?.[0]||[]).map((x:any)=>String(x||""));
+  if(expectedAQHeader.some((x:string,i:number)=>aqHeader[i]!==x)){
+    throw new Error("CORE:action_queue_schema_changed");
+  }
+
+  const oldAQ=await readValues(id,"ACTION QUEUE!A2:Q",token);
   const manual=new Map<string,any[]>();
   for(const r of oldAQ.values||[]){
     const leadId=r?.[15];
@@ -628,9 +684,44 @@ async function coreSync(token:string){
   await writeTab(id,sm,"PRIORITY ENGINE",priorityEngine,token,1000,11);
 
   const check=await readValues(id,"COMMAND CENTER!A1:H25",token);
+  if(String(check.values?.[0]?.[0]||"")!=="BOOKED SOLID — COMMAND CENTER")throw new Error("CORE:verify_command_header");
+  if(Number(check.values?.[2]?.[1]||-1)!==companies.length)throw new Error("CORE:verify_company_count");
+  if(Number(check.values?.[2]?.[3]||-1)!==leads.length)throw new Error("CORE:verify_lead_count");
+  if(Number(check.values?.[2]?.[5]||-1)!==qualified.length)throw new Error("CORE:verify_qualified_count");
+  if(Number(check.values?.[2]?.[7]||-1)!==candidates.length)throw new Error("CORE:verify_candidate_count");
+
+  const verification:any[]=[];
+  verification.push(await verifyHeaderAndCount(id,"ACTION QUEUE","Company",qualified.length,token));
+  verification.push(await verifyHeaderAndCount(id,"QUALIFIED 360","Company",qualified.length,token));
+  verification.push(await verifyHeaderAndCount(id,"ALL LEADS","Company",leads.length,token));
+  verification.push(await verifyHeaderAndCount(id,"COMPANIES","Company",companies.length,token));
+  verification.push(await verifyHeaderAndCount(id,"CONTACTS","Company",contacts.length,token));
+  verification.push(await verifyHeaderAndCount(id,"MESSAGES","Company",messages.length,token));
+  verification.push(await verifyHeaderAndCount(id,"EVIDENCE","Company",evidence.length,token));
+
+  const tradeCheck=await readValues(id,"TRADE SUMMARY!A1:F1",token);
+  if(String(tradeCheck.values?.[0]?.[0]||"")!=="Trade"||String(tradeCheck.values?.[0]?.[1]||"")!=="Qualified")throw new Error("CORE:verify_trade_summary_header");
+
+  const postAQ=await readValues(id,"ACTION QUEUE!A2:Q",token);
+  const postManual=new Map<string,any[]>();
+  for(const r of postAQ.values||[]){
+    const leadId=r?.[15];
+    if(leadId)postManual.set(String(leadId),[r?.[11]||"Not Reviewed",r?.[12]||"",r?.[13]||"",r?.[14]||""]);
+  }
+  for(const [leadId,before] of manual.entries()){
+    const after=postManual.get(leadId);
+    if(!after)continue;
+    if(before.some((v:any,i:number)=>String(v??"")!==String(after[i]??""))){
+      throw new Error("CORE:manual_fields_changed:"+leadId);
+    }
+  }
+
+  const priorityCheck=await readValues(id,"PRIORITY ENGINE!A1:K4",token);
+  if(String(priorityCheck.values?.[0]?.[0]||"")!=="PRIORITY YIELD ENGINE")throw new Error("CORE:verify_priority_engine_header");
+
   return {ok:true,companies:companies.length,leads:leads.length,qualified:qualified.length,candidates:candidates.length,
     ready:ready.length,contact_forms:contactForms.length,phone_only:phoneOnly.length,contacts:contacts.length,evidence:evidence.length,
-    due_work:dueNow,running_work:runningWork,command_rows:(check.values||[]).length};
+    due_work:dueNow,running_work:runningWork,command_rows:(check.values||[]).length,verification};
 }
 
 async function syncPending(token:string){
@@ -645,6 +736,10 @@ async function syncPending(token:string){
       if(req.sync_scope==="CORE_CRM")result=await coreSync(token);
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
+
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v19",result};
+      const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
+      if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
       const {error:finishErr}=await db.rpc("finish_solidos_sheet_sync",{p_id:req.id,p_status:"SUCCEEDED",p_error:null});
       if(finishErr)throw new Error("finish_request:"+finishErr.message);
