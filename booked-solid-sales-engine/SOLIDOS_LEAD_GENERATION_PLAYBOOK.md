@@ -361,3 +361,18 @@ The live worklist columns are:
 Ranking is by Readiness, Revenue Score, Priority, then Opportunity. Decision Maker/Role appear only when verified. A general company inbox is a route, not automatically that named person's personal email.
 
 Acceptance: CORE_CRM request 18579 completed SUCCEEDED under Sheet Sync **v28**, verified the Courtney tab, and wrote 10 live priority rows with the new Readiness column.
+
+## Courtney Sales Desk Priority Semantics v9
+
+Do not use an ambiguous single `Priority` label on the Courtney sales dashboard.
+
+Two distinct systems are shown and must remain separate:
+
+- **Lead Strength:** HOT / HIGH / SIGNAL / STANDARD — how strong the lead is.
+- **Sales Readiness:** ACT NOW / REVIEW / ENRICH / WATCH — what Courtney should do with it now.
+
+Courtney's work order is: **Sales Readiness first, then Lead Strength within the same readiness tier.** A HOT lead is not automatically "contact now" if its Sales Readiness is still ENRICH or WATCH.
+
+The START HERE — COURTNEY page now shows the full live distribution for both systems and uses the explicit columns **Lead Strength** and **Sales Readiness**. This is a display/interpretation improvement only; scoring thresholds, source routing, qualification, outreach, and worker capacity are unchanged.
+
+Known-good Sheet Sync deployment for this behavior: **v30**.
