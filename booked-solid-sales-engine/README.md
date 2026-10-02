@@ -1,6 +1,6 @@
 # Booked Solid Sales Engine
 
-> **AGENT START HERE:** Before changing SolidOS lead generation, planner, sources, qualification, or Source Recovery, read [SOLIDOS_LEAD_GENERATION_PLAYBOOK.md](./SOLIDOS_LEAD_GENERATION_PLAYBOOK.md) and query `solidos_control.lead_generation_playbook_snapshot()`. The database playbook is the authoritative latest operating doctrine.
+> **AGENT START HERE:** Before changing SolidOS lead generation, planner, sources, qualification, or Source Recovery, run `select solidos_control.future_chat_bootstrap();` first, then read [SOLIDOS_LEAD_GENERATION_PLAYBOOK.md](./SOLIDOS_LEAD_GENERATION_PLAYBOOK.md). The database playbook is the authoritative latest operating doctrine.
 
 Autonomous lead-research and outbound orchestration for Booked Solid Copy.
 
