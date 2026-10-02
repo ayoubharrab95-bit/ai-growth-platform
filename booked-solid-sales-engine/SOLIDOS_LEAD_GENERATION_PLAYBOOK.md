@@ -376,3 +376,15 @@ Courtney's work order is: **Sales Readiness first, then Lead Strength within the
 The START HERE — COURTNEY page now shows the full live distribution for both systems and uses the explicit columns **Lead Strength** and **Sales Readiness**. This is a display/interpretation improvement only; scoring thresholds, source routing, qualification, outreach, and worker capacity are unchanged.
 
 Known-good Sheet Sync deployment for this behavior: **v30**.
+
+## Courtney Sales Desk Completeness v10
+
+The Courtney Sales Desk must never make the priority picture look incomplete.
+
+- **Lead Strength** always uses HOT / HIGH / SIGNAL / STANDARD and must sum to total Qualified.
+- **Sales Readiness** uses ACT NOW / REVIEW / ENRICH / WATCH.
+- Newly Qualified leads that have not yet received Revenue Intelligence scoring are shown explicitly as **PENDING SCORE** rather than disappearing from the readiness totals.
+- PENDING SCORE means “awaiting revenue scoring,” not “weak lead.”
+- Work order remains: **Sales Readiness first, then Lead Strength within the same readiness tier.**
+
+Known-good Sheet Sync for this behavior: **v31**.
