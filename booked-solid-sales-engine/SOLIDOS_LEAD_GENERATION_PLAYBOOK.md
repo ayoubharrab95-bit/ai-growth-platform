@@ -197,3 +197,39 @@ If flow becomes bursty again, inspect **cursor progress → Nominatim deferrals 
 A planner cycle may contain **at most one mature zero-yield source job**. Extra mature zero-yield routed candidates are skipped and replaced by the next safe routable Proven/Testing candidate. This preserves source learning without allowing zero-yield exploration to consume most of the Resolve pipeline.
 
 Acceptance evidence after the continuity fixes included **3 KINGS ENVIRONMENTAL INC → Qualified + HOT**, score 96, Opportunity 80, Trigger 40, from Washington L&I.
+
+## Stability Charter v4 — preserve the working system
+
+**Future chats/agents must start with:**
+
+`select solidos_control.future_chat_bootstrap();`
+
+This is the read-only startup context for SolidOS. It returns the operating playbook, current system health, rolling 15m/30m/60m flow, pipeline pressure, Strategy Brain + AutoPilot + Portfolio, Source Recovery, pg_net runtime health, and persistent source cursor state.
+
+### Known-good runtime baseline
+
+- Orchestrator **v60**
+- Worker **v116**
+- Qualifier **v20**
+- Sheet Sync **v23**
+- Revenue CRM Writer **v1**
+
+This is a rollback/reference baseline, not a permanent freeze. Replace it only after a newer change is verified with real production evidence.
+
+### Stability rules
+
+1. **Preserve first, optimize second.** Do not change planner/source/qualifier/worker behavior because of a short-term fluctuation.
+2. **One change at a time.** Changes must be reversible, small, and canary-first.
+3. **Use rolling evidence.** Compare 15m/30m/60m Companies, valid Leads, Qualified, HOT/HIGH, and latest valid Lead before declaring a stall.
+4. **Backpressure is not failure.** A short pause/throttle while downstream drains is normal if completions continue and the planner resumes automatically.
+5. **Diagnose in order:** rolling flow → pressure/backlog → pg_net → source cursor → Nominatim deferrals → lane capacity → source mix → only then code/scoring.
+6. **Do not touch without evidence:** scoring thresholds, identity/geography guards, ALLOWED-only rights gate, persistent cursor, Nominatim enrichment policy, pg_net watchdog/queue guards, adaptive capacity, mature zero-yield cycle cap, or safety flags.
+7. **Rollback before layering fixes.** If a new change causes a real stall or material quality degradation, revert that change before adding another modification.
+
+### Current learning
+
+The strongest behavior so far comes from productive Champion sources, persistent pagination, soft/adaptive routing, fast downstream draining, and strict identity/rights safety — **not from adding more hard gates**.
+
+### Definition of a real stall
+
+Treat the system as genuinely stalled only when valid Leads/new companies materially stop across sustained rolling windows **or** queues stop draining/responding. A momentary pause with healthy completion flow is normal operating behavior.
