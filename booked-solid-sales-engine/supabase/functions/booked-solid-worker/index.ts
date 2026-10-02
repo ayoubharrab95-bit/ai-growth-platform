@@ -411,13 +411,21 @@ async function verifiedWebsiteFromNameGuess(company:any,locText:string){
    else if(brand.length>=2&&brandHits>=Math.min(2,brand.length)&&hostBrand)matched=true;
    else if(brand.length===1&&brand[0].length>=5&&brandHits>=1&&hostBrand&&(descriptorHit||descriptors.length===0))matched=true;
    if(!matched)continue;
-   const marketTokens=normalize(String(locText||"")).split(" ").filter(t=>t.length>=4);
-   const marketHit=marketTokens.some(t=>hay.includes(t));
+   const rawLocation=String(locText||"").trim();
+   const marketTokens=normalize(rawLocation).split(" ").filter(t=>t.length>=3&&!["usa","united","states"].includes(t));
+   const stateCode=(rawLocation.match(/\b([A-Z]{2})\b/)?.[1]||"").toUpperCase();
+   const stateName=stateCode
+     ? Object.entries(STATE_CODE_BY_NAME).find(([,code]:any)=>String(code)===stateCode)?.[0]||""
+     : "";
+   const marketHit=marketTokens.some(t=>hay.includes(t))||(stateName?hay.includes(normalize(stateName)):false);
+   // Name-only domain guesses are unsafe across common contractor names.
+   // For a specific location, require public site text to corroborate the market.
+   if(usefulResolutionLocation(rawLocation)&&!marketHit)continue;
    return {
      url:rr.url||("https://"+finalDomain+"/"),
      domain:finalDomain,
      method:"verified_name_domain_guess",
-     confidence:exactish?84:(marketHit?80:76),
+     confidence:exactish&&marketHit?90:(marketHit?84:76),
      title:title||h1||null
    };
   }catch{}
@@ -664,7 +672,30 @@ async function searchOregonHarp(){
 function firstMapped(row:any,map:any,key:string){
  const f=String(map?.[key]||"");return f?row?.[f]:null;
 }
-async function searchGenericSocrata(source:any,trade:string){
+
+const STATE_CODE_BY_NAME:any={
+ "alabama":"AL","alaska":"AK","arizona":"AZ","arkansas":"AR","california":"CA","colorado":"CO","connecticut":"CT","delaware":"DE","florida":"FL","georgia":"GA","hawaii":"HI","idaho":"ID","illinois":"IL","indiana":"IN","iowa":"IA","kansas":"KS","kentucky":"KY","louisiana":"LA","maine":"ME","maryland":"MD","massachusetts":"MA","michigan":"MI","minnesota":"MN","mississippi":"MS","missouri":"MO","montana":"MT","nebraska":"NE","nevada":"NV","new hampshire":"NH","new jersey":"NJ","new mexico":"NM","new york":"NY","north carolina":"NC","north dakota":"ND","ohio":"OH","oklahoma":"OK","oregon":"OR","pennsylvania":"PA","rhode island":"RI","south carolina":"SC","south dakota":"SD","tennessee":"TN","texas":"TX","utah":"UT","vermont":"VT","virginia":"VA","washington":"WA","west virginia":"WV","wisconsin":"WI","wyoming":"WY","district of columbia":"DC"
+};
+function targetStateCode(target:string){
+ const t=String(target||"").trim();
+ const m=t.match(/\b([A-Z]{2})\b/);
+ if(m)return m[1].toUpperCase();
+ const n=normalize(t);
+ for(const [name,code] of Object.entries(STATE_CODE_BY_NAME))if(n===normalize(name))return String(code);
+ return null;
+}
+function genericGeoCompatible(source:any,target:string,rowState?:string|null){
+ const t=String(target||"").trim();
+ if(!t||t==="US"||t==="United States")return true;
+ const wanted=targetStateCode(t);
+ const sourceState=String(source?.metadata?.jurisdiction_state||"").trim().toUpperCase();
+ const row=String(rowState||"").trim().toUpperCase();
+ if(wanted&&sourceState&&wanted!==sourceState)return false;
+ if(wanted&&row&&wanted!==row)return false;
+ if(wanted&&!sourceState&&!row)return false;
+ return true;
+}
+async function searchGenericSocrata(source:any,trade:string,geography:string){
  const m=source?.metadata??{};const domain=String(m.api_domain||"").replace(/^https?:\/\//,"").replace(/\/$/,"");
  const rid=String(m.resource_id||"");const fm=m.field_map??{};
  if(!domain||!rid||!fm.company)throw new Error("generic_socrata_missing_metadata");
@@ -683,7 +714,7 @@ async function searchGenericSocrata(source:any,trade:string){
   const descRaw=String(firstMapped(row,fm,"description")||"");
   const tradeField=String(fm.trade||"").toLowerCase();
   const strongTradeField=/(contractor|license|licence|trade|specialty|speciality)/.test(tradeField);
-  const tradeHint=inferPermitTrade((strongTradeField?tradeRaw+" ":"")+name)??(trade!=="Mixed"?trade:null);
+  const tradeHint=inferPermitTrade((strongTradeField?tradeRaw+" ":"")+descRaw+" "+name);
   const date=firstMapped(row,fm,"date");
   const permit=firstMapped(row,fm,"permit");
   const license=firstMapped(row,fm,"license");
@@ -691,6 +722,7 @@ async function searchGenericSocrata(source:any,trade:string){
   const phone=String(firstMapped(row,fm,"phone")||"").trim();
   const city=String(firstMapped(row,fm,"city")||"").trim();
   const state=String(firstMapped(row,fm,"state")||"").trim();
+  if(!genericGeoCompatible(source,geography,state))continue;
   const sourceKind=String(m.source_kind||"permit");
   const evidenceType=sourceKind.includes("license")?"trade_license":"permit_activity";
   const label=sourceKind.includes("license")?"Official contractor/license record":"Official permit/contractor record";
@@ -712,7 +744,7 @@ async function searchGenericSocrata(source:any,trade:string){
  return {provider:source.slug,results};
 }
 
-async function searchGenericArcGIS(source:any,trade:string){
+async function searchGenericArcGIS(source:any,trade:string,geography:string){
  const m=source?.metadata??{};const service=String(m.service_url||"").replace(/\/$/,"");const fm=m.field_map??{};
  if(!service||!fm.company)throw new Error("generic_arcgis_missing_metadata");
  const u=new URL(service+"/query");
@@ -731,8 +763,10 @@ async function searchGenericArcGIS(source:any,trade:string){
   const k=normalize(name);if(!k||seen.has(k))continue;seen.add(k);
   const tradeRaw=String(fm.trade?row?.[fm.trade]??"":"");const descRaw=String(fm.description?row?.[fm.description]??"":"");
   const tradeField=String(fm.trade||"").toLowerCase();const strongTradeField=/(contractor|license|licence|trade|specialty|speciality)/.test(tradeField);
-  const tradeHint=inferPermitTrade((strongTradeField?tradeRaw+" ":"")+name)??(trade!=="Mixed"?trade:null);
+  const tradeHint=inferPermitTrade((strongTradeField?tradeRaw+" ":"")+descRaw+" "+name);
   const email=String(fm.email?row?.[fm.email]??"":"").trim().toLowerCase();
+  const rowState=fm.state?String(row?.[fm.state]??"").trim():"";
+  if(!genericGeoCompatible(source,geography,rowState))continue;
   const sourceKind=String(m.source_kind||"permit");const evidenceType=sourceKind.includes("license")?"trade_license":"permit_activity";
   const permit=fm.permit?row?.[fm.permit]:null;const license=fm.license?row?.[fm.license]:null;
   results.push({url:null,title:name,description:(sourceKind.includes("license")?"Official contractor/license record":"Official permit/contractor record")+(permit?" · permit "+permit:"")+(license?" · license "+license:"")+(tradeRaw?" · "+tradeRaw:"")+(descRaw?" · "+descRaw.slice(0,240):""),meta:{
@@ -912,20 +946,56 @@ async function resolveCompany(job:any){
    await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"insufficient_location",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
    return {resolved:false,reason:"insufficient_location_for_resolution",qualification_fallback:await queueQualifyFallback(job,c,"insufficient_location")};
   }
-  if(!hit&&osmCooling){
-   const resumeAt=new Date(Math.max(Date.now()+5*60000,osmCooldownMs+60000)).toISOString();
-   return await deferResolveJob(job,c,"openstreetmap_cooldown",resumeAt,{cooldown_until:osmCooldownRaw});
-  }
-
+  // Overpass health must never block independent website/geocoder resolution.
+  // If Overpass is cooling or disabled, it is bypassed later and qualification
+  // can continue from existing company/permit evidence.
   if(!hit&&(!Number.isFinite(lat)||!Number.isFinite(lon))){
+   const priorGeoDefers=Number(job.payload?.nominatim_defer_count||0);
+
    if(geoCooling){
+    if(priorGeoDefers>=1||Number(job.attempts||0)>=2){
+     await db.schema("booked_solid").from("companies").update({
+      metadata:{
+       ...(c.metadata??{}),
+       preflight_version:2,
+       preflight_status:"geocoder_cooldown_fallback",
+       preflight_last_attempt_at:new Date().toISOString(),
+       preflight_geocoder_defers:priorGeoDefers
+      }
+     }).eq("id",id);
+     return {
+      resolved:false,
+      reason:"nominatim_cooldown_fallback",
+      qualification_fallback:await queueQualifyFallback(job,c,"nominatim_cooldown")
+     };
+    }
+    job.payload={...job.payload,nominatim_defer_count:priorGeoDefers+1};
     const resumeAt=new Date(Math.max(Date.now()+5*60000,geoCooldownMs+60000)).toISOString();
-    return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{cooldown_until:geoCooldownRaw});
+    return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{cooldown_until:geoCooldownRaw,nominatim_defer_count:priorGeoDefers+1});
    }
+
    cachedGeo=await resolveLocationWithNominatim(String(c.name||""),locText);
    if(cachedGeo?.error){
+    if(priorGeoDefers>=1||Number(job.attempts||0)>=2){
+     await db.schema("booked_solid").from("companies").update({
+      metadata:{
+       ...(c.metadata??{}),
+       preflight_version:2,
+       preflight_status:"geocoder_error_fallback",
+       preflight_last_attempt_at:new Date().toISOString(),
+       preflight_last_error:cachedGeo.error,
+       preflight_geocoder_defers:priorGeoDefers
+      }
+     }).eq("id",id);
+     return {
+      resolved:false,
+      reason:"nominatim_error_fallback",
+      qualification_fallback:await queueQualifyFallback(job,c,"nominatim_error")
+     };
+    }
+    job.payload={...job.payload,nominatim_defer_count:priorGeoDefers+1};
     const resumeAt=String(cachedGeo.cooldown_until||new Date(Date.now()+30*60000).toISOString());
-    return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{nominatim_error:cachedGeo.error});
+    return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{nominatim_error:cachedGeo.error,nominatim_defer_count:priorGeoDefers+1});
    }
    if(cachedGeo){
     lat=Number(cachedGeo.lat);lon=Number(cachedGeo.lon);
@@ -936,7 +1006,7 @@ async function resolveCompany(job:any){
    }
   }
 
-  if(!hit&&Number.isFinite(lat)&&Number.isFinite(lon)&&osmDegraded){
+  if(!hit&&Number.isFinite(lat)&&Number.isFinite(lon)&&(osmDegraded||osmCooling)){
    await db.schema("booked_solid").from("companies").update({metadata:{...(c.metadata??{}),preflight_version:2,preflight_status:"overpass_bypassed_degraded_source",preflight_last_attempt_at:new Date().toISOString()}}).eq("id",id);
    return {resolved:false,reason:"overpass_bypassed_degraded_source",qualification_fallback:await queueQualifyFallback(job,c,"overpass_bypassed_degraded_source")};
   }
@@ -987,10 +1057,40 @@ async function resolveCompany(job:any){
  if(!(rq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+(resolutionMethod==="verified_contact_email_domain"?5:3),payload:{company_id:id,strategy_id:job.payload.strategy_id,reason:"preflight_v2",resolution_method:resolutionMethod},status:"pending"});
  return {resolved:true,domain,resolution_method:resolutionMethod,resolution_confidence:resolutionConfidence,preflight_score:preflightScore};
 }
+
+function discoveryTradeCompatible(strategyTrade:string,resultTrade?:string|null){
+ const s=String(strategyTrade||"Mixed"),r=String(resultTrade||"").trim();
+ if(!r||s==="Mixed")return true;
+ if(s===r)return true;
+ if(["Roofing","Commercial Roofing"].includes(s)&&r==="Roofing")return true;
+ if(["HVAC","Commercial HVAC"].includes(s)&&r==="HVAC")return true;
+ if(["General Contractor","Commercial Contractor","Construction"].includes(s)&&["General Contractor","Commercial Contractor"].includes(r))return true;
+ return false;
+}
+function discoveryAttribution(p:any,q:string){
+ return {
+  discovery_strategy_id:p.strategy_id??null,
+  discovery_strategy_slug:p.strategy_slug??null,
+  discovery_offer_hint:p.offer_hint??null,
+  discovery_intent:p.intent??null,
+  discovery_query_template:p.query_template??null,
+  discovery_query:q,
+  discovery_geography:p.geography??null,
+  discovery_source_slug:p.source_slug??null,
+  discovery_at:new Date().toISOString()
+ };
+}
 async function discover(job:any){
  const p=job.payload;const q=String(p.query_template??"").replace("{trade}",p.trade??"Mixed").replace("{location}",p.geography==="US"?"United States":String(p.geography??"US"));let sr:any;
  const {data:sourceDef}=await db.schema("booked_solid").from("source_catalog").select("*").eq("slug",p.source_slug).maybeSingle();
- const discoveryTier=String(sourceDef?.metadata?.discovery_tier??sourceDef?.metadata?.lead_yield?.tier??"testing");
+ const sourcePurposeText=(String(p.source_slug||"")+" "+String(sourceDef?.name||"")+" "+String(sourceDef?.metadata?.source_kind||"")).toLowerCase();
+ if(String(p.trade||"")==="Property Operations"
+    && /(permit|dob|contractor license|trade license)/.test(sourcePurposeText)
+    && !/(property management|property operations|housing|multifamily|rental)/.test(sourcePurposeText)){
+   return {provider:String(p.source_slug||"unknown"),discovered:0,blocked_reason:"source_purpose_mismatch_property_operations"};
+ }
+ const brainLane=String(sourceDef?.metadata?.brain_v2?.lane??"");
+ const discoveryTier=brainLane==="exploration"?"exploration_only":brainLane==="proven"?"proven":brainLane==="testing"?"testing":String(sourceDef?.metadata?.discovery_tier??sourceDef?.metadata?.lead_yield?.tier??"testing");
  const discoveryCompanyCap=discoveryTier==="exploration_only"?2:discoveryTier==="testing"?3:5;
  if(p.source_slug==="openstreetmap_overpass")sr=await searchOSM(p.trade,p.geography,p.latitude,p.longitude);
  else if(p.source_slug==="wikidata_sparql")sr=await searchWikidata(p.geography,p.latitude,p.longitude);
@@ -999,10 +1099,14 @@ async function discover(job:any){
  else if(p.source_slug==="oregon_harp_contractors")sr=await searchOregonHarp();
  else if(p.source_slug==="usaspending_api")sr=await searchUSASpending(p.trade,p.geography,p.latitude,p.longitude);
  else if(p.source_slug==="nrca_official")sr=await searchNRCADirect(p.geography);
- else if(sourceDef?.metadata?.adapter==="generic_socrata")sr=await searchGenericSocrata(sourceDef,p.trade??"Mixed");
- else if(sourceDef?.metadata?.adapter==="generic_arcgis")sr=await searchGenericArcGIS(sourceDef,p.trade??"Mixed");
+ else if(sourceDef?.metadata?.adapter==="generic_socrata")sr=await searchGenericSocrata(sourceDef,p.trade??"Mixed",String(p.geography??"US"));
+ else if(sourceDef?.metadata?.adapter==="generic_arcgis")sr=await searchGenericArcGIS(sourceDef,p.trade??"Mixed",String(p.geography??"US"));
  else sr=await search(q);let n=0;
- for(const item of sr.results){if(n>=discoveryCompanyCap)break;const itemName=String(item.title??"").trim();const domain=domainOf(item.url??"");const sourceLoc=locationFromMeta(item.meta??{},sr.provider,item.meta?.source_url??item.url,Number(item.meta?.evidence_confidence??(sr.provider==="openstreetmap_overpass"?88:90)));if(!domain&&item.meta?.needs_website_resolution){
+ for(const item of sr.results){
+  if(n>=discoveryCompanyCap)break;
+  const itemTrade=String(item.meta?.trade_hint??"").trim();
+  if(itemTrade&&!discoveryTradeCompatible(String(p.trade||"Mixed"),itemTrade))continue;
+  const itemName=String(item.title??"").trim();const domain=domainOf(item.url??"");const sourceLoc=locationFromMeta(item.meta??{},sr.provider,item.meta?.source_url??item.url,Number(item.meta?.evidence_confidence??(sr.provider==="openstreetmap_overpass"?88:90)));if(!domain&&item.meta?.needs_website_resolution){
    if(itemName.length<3)continue;const nn=normalize(itemName);let c:any;let existingByName:any=null;let identityMethod:string|null=null;
    const sourceState=String(sourceLoc?.state??item.meta?.state??"").trim().toUpperCase();
    const sourceLocation=normalize(String(sourceLoc?.location_text??""));
@@ -1026,8 +1130,8 @@ async function discover(job:any){
    }
    if(existingByName){
     if(sourceLoc&&(!existingByName.location_text||!existingByName.state)){const patch:any={metadata:{...(existingByName.metadata??{}),identity_version:2,identity_status:"matched_existing",identity_method:identityMethod,identity_confidence:identityMethod==="exact_public_email"?98:92,identity_last_seen_at:new Date().toISOString(),location_provenance:existingByName.metadata?.location_provenance??sourceLoc.provenance}};if(!existingByName.location_text)patch.location_text=sourceLoc.location_text;if(!existingByName.state&&sourceLoc.state)patch.state=sourceLoc.state;if(!existingByName.country&&sourceLoc.country)patch.country=sourceLoc.country;const {data:u,error:ue}=await db.schema("booked_solid").from("companies").update(patch).eq("id",existingByName.id).select("*").single();if(ue)throw ue;c=u;}else c=existingByName;
-   }else{const inferredTrade=item.meta?.trade_hint??(item.meta?.source_trade_independent?null:(p.trade==="Mixed"?null:p.trade));const {data:i,error:ie}=await db.schema("booked_solid").from("companies").insert({canonical_domain:null,normalized_name:nn,name:itemName,trade:inferredTrade,website_url:null,source_first_seen:sr.provider,source_last_seen:sr.provider,status:"discovered",location_text:sourceLoc?.location_text??null,state:sourceLoc?.state??null,country:sourceLoc?.country??"US",metadata:{query:q,search_market:p.geography,needs_website_resolution:true,geography:p.geography,permit_trade_hint:item.meta?.trade_hint??null,source_market:item.meta?.city||item.meta?.state?([item.meta?.city,item.meta?.state].filter(Boolean).join(" ")):null,identity_version:2,identity_status:"new_unresolved",identity_key:nn+"|"+(sourceState||normalize(String(sourceLoc?.location_text??p.geography??""))),preflight_version:2,preflight_status:"needs_resolution",...(sourceLoc?{location_provenance:sourceLoc.provenance}:{})}}).select("*").single();if(ie)throw ie;c=i;}
-   const et=item.meta?.evidence_type??"permit_activity";const conf=Number(item.meta?.evidence_confidence??90);const {error:pe}=await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:et,claim:item.description??(et==="trade_license"?"Active official trade license":"Recent official permit activity"),snippet:item.description??null,source_url:item.meta?.source_url??permitSourceUrl(sr.provider),confidence:conf,metadata:{provider:sr.provider,query:q,...(item.meta??{})}});if(pe)throw pe;
+   }else{const inferredTrade=item.meta?.trade_hint??(item.meta?.source_trade_independent?null:(p.trade==="Mixed"?null:p.trade));const {data:i,error:ie}=await db.schema("booked_solid").from("companies").insert({canonical_domain:null,normalized_name:nn,name:itemName,trade:inferredTrade,website_url:null,source_first_seen:sr.provider,source_last_seen:sr.provider,status:"discovered",location_text:sourceLoc?.location_text??null,state:sourceLoc?.state??null,country:sourceLoc?.country??"US",metadata:{query:q,search_market:p.geography,needs_website_resolution:true,geography:p.geography,permit_trade_hint:item.meta?.trade_hint??null,source_market:item.meta?.city||item.meta?.state?([item.meta?.city,item.meta?.state].filter(Boolean).join(" ")):null,identity_version:2,identity_status:"new_unresolved",identity_key:nn+"|"+(sourceState||normalize(String(sourceLoc?.location_text??p.geography??""))),preflight_version:2,preflight_status:"needs_resolution",...discoveryAttribution(p,q),...(sourceLoc?{location_provenance:sourceLoc.provenance}:{})}}).select("*").single();if(ie)throw ie;c=i;}
+   const et=item.meta?.evidence_type??"permit_activity";const conf=Number(item.meta?.evidence_confidence??90);const {error:pe}=await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:et,claim:item.description??(et==="trade_license"?"Active official trade license":"Recent official permit activity"),snippet:item.description??null,source_url:item.meta?.source_url??permitSourceUrl(sr.provider),confidence:conf,metadata:{provider:sr.provider,query:q,strategy_id:p.strategy_id??null,strategy_slug:p.strategy_slug??null,offer_hint:p.offer_hint??null,...(item.meta??{})}});if(pe)throw pe;
    if(item.meta?.email){
     const em=String(item.meta.email).toLowerCase();const {data:ec}=await db.schema("booked_solid").from("contacts").select("id").eq("company_id",c.id).eq("email",em).maybeSingle();
     if(!ec)await db.schema("booked_solid").from("contacts").insert({company_id:c.id,email:em,email_confidence:85,source_url:item.meta?.source_url??null,status:"unverified",role:"Public contractor contact"});
@@ -1046,12 +1150,12 @@ async function discover(job:any){
   let c:any;const {data:existing,error:xe}=await db.schema("booked_solid").from("companies").select("*").eq("canonical_domain",domain).maybeSingle();if(xe)throw xe;
   if(existing){
    if(existing.metadata?.hard_excluded_vendor||existing.metadata?.hard_excluded_source)continue;
-   const patch:any={source_last_seen:sr.provider,trade:existing.trade??(p.trade==="Mixed"?null:p.trade),metadata:{...(existing.metadata??{}),query:q,search_market:p.geography,...(sourceLoc&&(!existing.location_text||!existing.state)?{location_provenance:existing.metadata?.location_provenance??sourceLoc.provenance}:{})}};
+   const patch:any={source_last_seen:sr.provider,trade:existing.trade??(p.trade==="Mixed"?null:p.trade),metadata:{...(existing.metadata??{}),query:q,search_market:p.geography,last_discovery_strategy_id:p.strategy_id??null,last_discovery_strategy_slug:p.strategy_slug??null,last_discovery_source_slug:p.source_slug??null,last_discovery_at:new Date().toISOString(),...(sourceLoc&&(!existing.location_text||!existing.state)?{location_provenance:existing.metadata?.location_provenance??sourceLoc.provenance}:{})}};
    if(sourceLoc){if(!existing.location_text)patch.location_text=sourceLoc.location_text;if(!existing.state&&sourceLoc.state)patch.state=sourceLoc.state;if(!existing.country&&sourceLoc.country)patch.country=sourceLoc.country;}
    const {data:u,error:ue}=await db.schema("booked_solid").from("companies").update(patch).eq("id",existing.id).select("*").single();if(ue)throw ue;c=u;
   }
-  else{const {data:i,error:ie}=await db.schema("booked_solid").from("companies").insert({canonical_domain:domain,normalized_name:normalize(name),name,trade:p.trade==="Mixed"?null:p.trade,website_url:"https://"+domain+"/",source_first_seen:sr.provider,source_last_seen:sr.provider,status:"discovered",location_text:sourceLoc?.location_text??null,state:sourceLoc?.state??null,country:sourceLoc?.country??"US",metadata:{query:q,search_market:p.geography,...(sourceLoc?{location_provenance:sourceLoc.provenance}:{})}}).select("*").single();if(ie)throw ie;c=i;}
-  const et=sr.provider==="nrca_official"?"association_membership":(sr.provider==="chicago_building_permits"||sr.provider==="nyc_dob_permits"||sr.provider==="austin_construction_permits"||sr.provider==="seattle_building_permits"||sr.provider==="boston_building_permits"||sr.provider==="sf_building_permit_contacts"||sr.provider==="philadelphia_permit_contractors"||sr.provider==="denver_commercial_permits")?"permit_activity":sr.provider==="usaspending_api"?"federal_award_signal":sr.provider==="wikidata_sparql"?"public_registry":"search_result";const conf=et==="association_membership"?90:et==="permit_activity"?90:et==="federal_award_signal"?92:et==="public_registry"?75:55;await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:et,claim:item.description??item.title??"Discovery evidence",snippet:item.description??null,source_url:item.meta?.directory_url??item.url,confidence:conf,metadata:{provider:sr.provider,query:q,...(item.meta??{})}});
+  else{const {data:i,error:ie}=await db.schema("booked_solid").from("companies").insert({canonical_domain:domain,normalized_name:normalize(name),name,trade:p.trade==="Mixed"?null:p.trade,website_url:"https://"+domain+"/",source_first_seen:sr.provider,source_last_seen:sr.provider,status:"discovered",location_text:sourceLoc?.location_text??null,state:sourceLoc?.state??null,country:sourceLoc?.country??"US",metadata:{query:q,search_market:p.geography,...discoveryAttribution(p,q),...(sourceLoc?{location_provenance:sourceLoc.provenance}:{})}}).select("*").single();if(ie)throw ie;c=i;}
+  const et=sr.provider==="nrca_official"?"association_membership":(sr.provider==="chicago_building_permits"||sr.provider==="nyc_dob_permits"||sr.provider==="austin_construction_permits"||sr.provider==="seattle_building_permits"||sr.provider==="boston_building_permits"||sr.provider==="sf_building_permit_contacts"||sr.provider==="philadelphia_permit_contractors"||sr.provider==="denver_commercial_permits")?"permit_activity":sr.provider==="usaspending_api"?"federal_award_signal":sr.provider==="wikidata_sparql"?"public_registry":"search_result";const conf=et==="association_membership"?90:et==="permit_activity"?90:et==="federal_award_signal"?92:et==="public_registry"?75:55;await db.schema("booked_solid").from("evidence").insert({company_id:c.id,evidence_type:et,claim:item.description??item.title??"Discovery evidence",snippet:item.description??null,source_url:item.meta?.directory_url??item.url,confidence:conf,metadata:{provider:sr.provider,query:q,strategy_id:p.strategy_id??null,strategy_slug:p.strategy_slug??null,offer_hint:p.offer_hint??null,...(item.meta??{})}});
   if(!c.last_researched_at)await db.schema("booked_solid").from("work_queue").insert({kind:"research",priority:Number(job.priority)+5,payload:{company_id:c.id,strategy_id:p.strategy_id},status:"pending"});n++;}
  await db.schema("booked_solid").rpc("record_source_success",{p_slug:p.source_slug});return {provider:sr.provider,source_slug:p.source_slug,query:q,results:sr.results.length,companies:n};
 }
@@ -1553,39 +1657,94 @@ function runtimeFailurePolicy(msg:string,attempts:number){
 
 async function probeOpenStreetMapSource(){
  const {data:s,error}=await db.schema("booked_solid").from("source_catalog")
-   .select("slug,enabled,lifecycle_state,metadata,consecutive_errors").eq("slug","openstreetmap_overpass").single();
+   .select("slug,enabled,lifecycle_state,metadata,consecutive_errors,reliability_score").eq("slug","openstreetmap_overpass").single();
  if(error)throw error;
- if(!s.enabled)return {ok:true,skipped:true,reason:"source_disabled"};
- const cooldownRaw=String(s.metadata?.cooldown_until||"");
- const cooldownMs=cooldownRaw?new Date(cooldownRaw).getTime():0;
- if(Number.isFinite(cooldownMs)&&cooldownMs>Date.now())return {ok:true,skipped:true,reason:"cooldown_active",cooldown_until:cooldownRaw};
- const state=String(s.lifecycle_state||"").toLowerCase();
- if(!["degraded","canary","testing"].includes(state)&&Number(s.consecutive_errors||0)===0){
-   return {ok:true,skipped:true,reason:"source_already_healthy"};
- }
+
+ const configured=Array.isArray(s.metadata?.endpoints)&&s.metadata.endpoints.length
+   ? s.metadata.endpoints.map((x:any)=>String(x)).filter(Boolean)
+   : ["https://overpass.private.coffee/api/interpreter","https://overpass-api.de/api/interpreter","https://maps.mail.ru/osm/tools/overpass/api/interpreter"];
+ const preferred=String(s.metadata?.recovery_preferred_endpoint||s.metadata?.last_health_probe_endpoint||"");
+ const endpoints=preferred&&configured.includes(preferred)
+   ? [preferred,...configured.filter((x:string)=>x!==preferred)]
+   : configured;
+
  const query='[out:json][timeout:4];node(around:1200,40.7128,-74.0060)["amenity"="fire_station"];out 1;';
- let lastStatus=0,lastError="";
- for(const base of ["https://maps.mail.ru/osm/tools/overpass/api/interpreter","https://overpass-api.de/api/interpreter","https://overpass.private.coffee/api/interpreter"]){
+ const attempts:any[]=[];
+ let success:any=null;
+
+ for(const base of endpoints){
+   const started=Date.now();
    try{
      const rr=await fetch(base,{method:"POST",signal:AbortSignal.timeout(6500),headers:{
        "User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)",
        "Accept":"application/json","Content-Type":"application/x-www-form-urlencoded"
      },body:new URLSearchParams({data:query})});
-     lastStatus=rr.status;
+     const latency=Date.now()-started;
+     attempts.push({endpoint:base,status:rr.status,ok:rr.ok,latency_ms:latency});
      if(rr.ok){
-       await rr.text();
-       await db.schema("booked_solid").rpc("record_source_success",{p_slug:"openstreetmap_overpass"});
-       await db.schema("booked_solid").from("source_catalog").update({
-         metadata:{...(s.metadata||{}),last_health_probe_at:new Date().toISOString(),last_health_probe_status:rr.status,last_health_probe_endpoint:base,last_error_class:null,last_runtime_error:null}
-       }).eq("slug","openstreetmap_overpass");
-       return {ok:true,recovered:true,status:rr.status,endpoint:base};
+       const body=await rr.json().catch(()=>null);
+       success={endpoint:base,status:rr.status,latency_ms:latency,result_count:Array.isArray(body?.elements)?body.elements.length:0};
+       break;
      }
-     lastError="overpass_http_"+rr.status;
-   }catch(e){lastError=e instanceof Error?e.message:String(e);}
+   }catch(e){
+     attempts.push({endpoint:base,status:0,ok:false,latency_ms:Date.now()-started,error:e instanceof Error?e.message:String(e)});
+   }
  }
- const err=lastError||("overpass_http_"+lastStatus);
- await db.schema("booked_solid").rpc("record_source_failure",{p_slug:"openstreetmap_overpass",p_error:err});
- return {ok:false,recovered:false,error:err,last_status:lastStatus};
+
+ const priorScore=Number(s.metadata?.recovery_probe_score??0);
+ const priorSuccess=Number(s.metadata?.recovery_probe_success_streak??0);
+ const priorFailure=Number(s.metadata?.recovery_probe_failure_streak??0);
+ const nowIso=new Date().toISOString();
+
+ if(success){
+   const successStreak=priorSuccess+1;
+   const probeScore=Math.min(100,Math.max(25,priorScore)+15);
+   await db.schema("booked_solid").from("source_catalog").update({
+     metadata:{
+       ...(s.metadata||{}),
+       recovery_probe_status:"healthy",
+       recovery_probe_score:probeScore,
+       recovery_probe_success_streak:successStreak,
+       recovery_probe_failure_streak:0,
+       recovery_preferred_endpoint:success.endpoint,
+       recovery_last_probe_at:nowIso,
+       recovery_last_success_at:nowIso,
+       recovery_last_attempts:attempts,
+       recovery_rights_gate:"REVIEW_REQUIRED",
+       recovery_production_enabled:false
+     },
+     updated_at:nowIso
+   }).eq("slug","openstreetmap_overpass");
+   return {
+     ok:true,recovered:true,technical_only:true,production_enabled:false,
+     rights_gate:"REVIEW_REQUIRED",probe_score:probeScore,success_streak:successStreak,
+     endpoint:success.endpoint,status:success.status,latency_ms:success.latency_ms,
+     result_count:success.result_count,attempts
+   };
+ }
+
+ const failureStreak=priorFailure+1;
+ const probeScore=Math.max(0,priorScore-20);
+ await db.schema("booked_solid").from("source_catalog").update({
+   metadata:{
+     ...(s.metadata||{}),
+     recovery_probe_status:"failed",
+     recovery_probe_score:probeScore,
+     recovery_probe_failure_streak:failureStreak,
+     recovery_probe_success_streak:0,
+     recovery_last_probe_at:nowIso,
+     recovery_last_failure_at:nowIso,
+     recovery_last_attempts:attempts,
+     recovery_rights_gate:"REVIEW_REQUIRED",
+     recovery_production_enabled:false
+   },
+   updated_at:nowIso
+ }).eq("slug","openstreetmap_overpass");
+
+ return {
+   ok:false,recovered:false,technical_only:true,production_enabled:false,
+   rights_gate:"REVIEW_REQUIRED",probe_score:probeScore,failure_streak:failureStreak,attempts
+ };
 }
 
 Deno.serve(async req=>{
