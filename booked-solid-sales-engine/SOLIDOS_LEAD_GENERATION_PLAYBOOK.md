@@ -388,3 +388,31 @@ The Courtney Sales Desk must never make the priority picture look incomplete.
 - Work order remains: **Sales Readiness first, then Lead Strength within the same readiness tier.**
 
 Known-good Sheet Sync for this behavior: **v31**.
+
+## Production Audit and Stability v11 — 2026-10-02
+
+This is the current verified baseline; earlier version entries describe historical recoveries:
+- Orchestrator v61; Worker v122; Qualifier v20; Sheet Sync v35; Revenue CRM Writer v4.
+- Brain runtime/stable 15%. Rollback hold until 2026-10-03T00:07:00.177904Z. Let AutoPilot decide after hold, health and sample gates.
+- Source rights and safety flags remain unchanged. OSM remains REVIEW_REQUIRED technical recovery only.
+
+Verified fixes, separately canaried:
+1. Lead status changes cancel only ready/blocked draft outreach for leads that leave qualified/sent/replied/meeting/won. Reconciled 10 stale drafts; qualified drafts preserved. Two database migrations record canary and promotion.
+2. Contact-form extraction rejects static assets, technical/login paths and external URLs. One live contact canary plus five repairs completed; six bad CSS links removed without dropping usable routes.
+3. Internal Worker qualification uses the standalone Qualifier's established trade/strategy compatibility rule. Learning uses validated attribution. Corrected 49 remaining mismatches (19 Qualified) without changing their status/score/priority; previous IDs retained in lead_brief.strategy_attribution_correction_v1. The separate qualification canary re-scored one Candidate from61 to59 through normal qualification.
+4. ACTION QUEUE, QUALIFIED 360 and CONTACT GAPS show person name/role only when decision_maker_known=true; email/phone routes remain independent. CORE_CRM canary request19796 succeeded. Manual fields for all95 Lead IDs matched before/after.
+5. Courtney order is Sales Readiness first, then Lead Strength, then Revenue Score and Opportunity. A real HIGH-before-HOT ACT NOW row ordering bug demonstrated that the old score-first sort violated the intended work order. The narrow display fix was fixture-tested and verified through existing CORE_CRM.
+
+Source outcomes at16:20 UTC (first-seen source; current status; rejected/suppressed excluded): Washington138 valid/38 Qualified/11 HOT+HIGH; Phoenix30/5/3; OSM125/43/14 historical. Historical OSM yield does not authorize new production use. Phoenix had no discovery jobs in the last measured3h while Washington had165; propose a small compatible-pair exposure canary after stability, not a speculative global allocation change.
+
+Measurement cautions:
+- 15/30/60 Qualified by Lead creation time is a currently-qualified creation cohort, not qualification event throughput.
+- Attribution repairs can alter strategy-derived historical Brain metrics. Do not claim Brain gains or infer historical causality from mutable attribution.
+- Historical strategy counters may contain stale attribution; rebuild only from auditable event provenance. Do not reset them speculatively.
+- Node syntax/fixture tests are not a complete Deno typecheck; actual completed canary jobs and sheet readback were also required.
+- Existing advisor findings were unchanged by DDL. No new public RLS policies or rights exceptions were introduced.
+- Keep global sheet serialization/cooloff, manual fields keyed by Lead ID, pg_net guards, persistent cursor, adaptive cap12, thresholds and safety flags.
+
+The development sequence is: observe corrected baseline; test a small Phoenix compatible-market slot; compare Qualified/HOT-HIGH and route yield per unique company and worker capacity; improve only proven latency bottlenecks; profile narrow Sheet reads offline before any batching canary; let AutoPilot govern Brain. No source mix/capacity/score optimization was deployed in this audit.
+
+See SOLIDOS_AUDIT_AND_DEVELOPMENT_PLAN_2026-10-02.md for source comparison, acceptance checks, rollback instructions and the staged plan.
