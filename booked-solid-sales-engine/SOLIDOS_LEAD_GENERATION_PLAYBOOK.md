@@ -311,3 +311,33 @@ A broad batching refactor was deployed briefly as platform Sheet Sync **v26** an
 ### Strategy Brain rollback hold
 
 Strategy Brain is intentionally at **15%** after Auto-Rollback. Stable pct is 15%, and the rollback hold runs until **2026-10-03 00:07 UTC**. Do **not** manually ramp during the hold. Canary performance was below Legacy in the post-rollback sample, and the rollback was triggered by real pipeline/SLA pressure. Let AutoPilot evaluate after the hold and only ramp when health and sample gates pass.
+
+## Courtney Sales Desk v9
+
+The first Google Sheets tab, **START HERE — COURTNEY**, is now the live **COURTNEY — SOLIDOS SALES DESK**.
+
+Architecture: it is **formula-driven from existing synced tabs** and intentionally has **no dedicated cron or writer**. This preserves Google Sheets quota headroom and keeps the sales desk synchronized automatically whenever upstream SolidOS tabs refresh.
+
+Live sources:
+- COMMAND CENTER
+- ACTION QUEUE
+- REVENUE DESK
+- CONTACT GAPS
+
+Live KPI strip:
+- ACT NOW
+- REVIEW
+- HOT
+- HIGH
+- NEEDS DECISION MAKER
+
+The live priority table shows the **Top 10 HOT/HIGH prospects from ACTION QUEUE ordered by Opportunity**, with Company, Priority, Opportunity, Decision Maker, Role / Title, Email, Phone, Why Now, Offer, and Action.
+
+Courtney workflow shown directly on the page:
+1. Verify the company/website.
+2. Check Decision Maker + Role + contact route.
+3. Use Why Now as the personalization clue.
+4. Pitch one relevant offer.
+5. Record review/follow-up in ACTION QUEUE.
+
+Important stability rule: **do not add a separate Courtney Sales Desk cron/writer unless formulas become insufficient**. The current formula-driven design creates no new recurring Google write load.
