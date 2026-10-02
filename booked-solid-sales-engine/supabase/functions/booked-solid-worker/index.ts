@@ -712,17 +712,40 @@ function genericGeoCompatible(source:any,target:string,rowState?:string|null){
  if(wanted&&!sourceState&&!row)return false;
  return true;
 }
-async function searchGenericSocrata(source:any,trade:string,geography:string){
+function stableScanHash(s:string){
+ let h=2166136261>>>0;
+ for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}
+ return h>>>0;
+}
+async function searchGenericSocrata(source:any,trade:string,geography:string,seed=""){
  const m=source?.metadata??{};const domain=String(m.api_domain||"").replace(/^https?:\/\//,"").replace(/\/$/,"");
  const rid=String(m.resource_id||"");const fm=m.field_map??{};
  if(!domain||!rid||!fm.company)throw new Error("generic_socrata_missing_metadata");
- const u=new URL("https://"+domain+"/resource/"+rid+".json");
- u.searchParams.set("$limit",String(Math.min(150,Number(m.fetch_limit||100))));
- u.searchParams.set("$where",String(fm.company)+" is not null");
- if(fm.date){u.searchParams.set("$order",String(fm.date)+" DESC");}
- const r=await fetch(u,{signal:AbortSignal.timeout(15000),headers:{"Accept":"application/json","User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});
- if(!r.ok)throw new Error("generic_socrata_http_"+r.status);
- const rows=await r.json();if(!Array.isArray(rows))throw new Error("generic_socrata_invalid_payload");
+ const pageSize=Math.min(150,Math.max(25,Number(m.fetch_limit||100)));
+ const scanPages=Math.max(2,Math.min(20,Number(m.scan_pages||12)));
+ const bucket=Math.floor(Date.now()/(15*60*1000));
+ const pageIndex=stableScanHash(String(source?.slug||rid)+"|"+trade+"|"+geography+"|"+seed+"|"+bucket)%scanPages;
+ const requestedOffset=pageIndex*pageSize;
+
+ const fetchPage=async(offset:number)=>{
+  const u=new URL("https://"+domain+"/resource/"+rid+".json");
+  u.searchParams.set("$limit",String(pageSize));
+  u.searchParams.set("$offset",String(Math.max(0,offset)));
+  u.searchParams.set("$where",String(fm.company)+" is not null");
+  if(fm.date){u.searchParams.set("$order",String(fm.date)+" DESC");}
+  const r=await fetch(u,{signal:AbortSignal.timeout(15000),headers:{"Accept":"application/json","User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});
+  if(!r.ok)throw new Error("generic_socrata_http_"+r.status);
+  const rows=await r.json();
+  if(!Array.isArray(rows))throw new Error("generic_socrata_invalid_payload");
+  return rows;
+ };
+
+ let usedOffset=requestedOffset;
+ let rows=await fetchPage(usedOffset);
+ if(!rows.length&&usedOffset>0){
+   usedOffset=0;
+   rows=await fetchPage(0);
+ }
  const seen=new Set<string>();const results:any[]=[];
  for(const row of rows){
   const name=String(firstMapped(row,fm,"company")||"").trim();if(!name||!companyLikePermitName(name))continue;
@@ -758,7 +781,7 @@ async function searchGenericSocrata(source:any,trade:string,geography:string){
   });
   if(results.length>=25)break;
  }
- return {provider:source.slug,results};
+ return {provider:source.slug,results,scan_offset:usedOffset,scan_page_size:pageSize,scan_page_index:Math.floor(usedOffset/pageSize)};
 }
 
 async function searchGenericArcGIS(source:any,trade:string,geography:string){
@@ -1116,7 +1139,12 @@ async function discover(job:any){
  else if(p.source_slug==="oregon_harp_contractors")sr=await searchOregonHarp();
  else if(p.source_slug==="usaspending_api")sr=await searchUSASpending(p.trade,p.geography,p.latitude,p.longitude);
  else if(p.source_slug==="nrca_official")sr=await searchNRCADirect(p.geography);
- else if(sourceDef?.metadata?.adapter==="generic_socrata")sr=await searchGenericSocrata(sourceDef,p.trade??"Mixed",String(p.geography??"US"));
+ else if(sourceDef?.metadata?.adapter==="generic_socrata")sr=await searchGenericSocrata(
+   sourceDef,
+   p.trade??"Mixed",
+   String(p.geography??"US"),
+   String(p.strategy_id??"")+"|"+String(p.strategy_slug??"")+"|"+String(p.intent??"")
+ );
  else if(sourceDef?.metadata?.adapter==="generic_arcgis")sr=await searchGenericArcGIS(sourceDef,p.trade??"Mixed",String(p.geography??"US"));
  else sr=await search(q);let n=0;
  for(const item of sr.results){
