@@ -626,11 +626,14 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
         l.offer||c.recommended_offer||"",c.website_url||"",c.location_text||"",c.state||"",searchMarket(c),l.id,l.company_id];
     })];
 
-  const allLeads=[["Company","Status","Priority","Opportunity","Score","Fit","Trade","Offer","Why Now","Email","Phone","Website","Verified Location","State","Search Market","Route","Lead ID","Company ID"],
+  const allLeads=[["Company","Status","Priority","Opportunity","Score","Fit","Trade","Decision Maker","Role / Title","Offer","Why Now","Email","Phone","Website","Verified Location","State","Search Market","Route","Lead ID","Company ID"],
     ...leads.slice().sort(sortLeads).map((l:any)=>{
-      const c=companyById.get(l.company_id)||{};
+      const c=companyById.get(l.company_id)||{},cr=contactResolution(l);
       return [c.name||"",l.status||"",fmtPri(l.priority_band),Number(l.opportunity_score)||0,Number(l.score)||0,Number(l.fit_score)||0,
-        c.trade||"",l.offer||c.recommended_offer||"",l.why_now||"",contactValue(l,"email"),contactValue(l,"phone"),
+        c.trade||"",
+        cr.decision_maker_known?(cr.decision_maker_name||""):"",
+        cr.decision_maker_known?(cr.decision_maker_role||""):"",
+        l.offer||c.recommended_offer||"",l.why_now||"",contactValue(l,"email"),contactValue(l,"phone"),
         c.website_url||"",c.location_text||"",c.state||"",searchMarket(c),routeLabel(l),l.id,l.company_id];
     })];
 
@@ -762,7 +765,7 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   await writeIf("ACTION QUEUE",aq,500,17);
   await writeIf("TRADE SUMMARY",trade,200,11);
   await writeIf("QUALIFIED 360",q360,300,18);
-  await writeIf("ALL LEADS",allLeads,500,18);
+  await writeIf("ALL LEADS",allLeads,500,20);
   await writeIf("COMPANIES",compRows,1000,20);
   await writeIf("CONTACTS",contRows,1000,20);
   await writeIf("MESSAGES",msgRows,1500,15);
@@ -858,7 +861,7 @@ async function syncPending(token:string){
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v23",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v25",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
