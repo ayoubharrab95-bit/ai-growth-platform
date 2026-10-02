@@ -1678,6 +1678,15 @@ async function contactResolve(job:any){
  if(!(mq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"message",priority:Number(lead.score||0)+score/10+Math.min(10,Number(lead.trigger_score||0)*0.10),payload:{lead_id:lead.id},status:"pending"});
  return {lead_id:lead.id,company:company.name,...resolution,queued_message:true};
 }
+function strategyTradeCompatible(strategyTrade:string,companyTrade:string){
+ const s=String(strategyTrade||"Mixed"),c=String(companyTrade||"").trim();
+ if(!s||s==="Mixed"||!c)return true;
+ if(s===c)return true;
+ if(["Roofing","Commercial Roofing"].includes(s)&&c==="Roofing")return true;
+ if(["HVAC","Commercial HVAC"].includes(s)&&c==="HVAC")return true;
+ if(["General Contractor","Commercial Contractor","Construction"].includes(s)&&["General Contractor","Commercial Contractor","Construction","Remodeling"].includes(c))return true;
+ return false;
+}
 async function qualify(job:any){
  const id=job.payload.company_id;
  const [{data:c,error:ce},{data:ev,error:ee},{data:ct,error:te},{data:existingLeads,error:lee},{data:settings,error:se}]=await Promise.all([
@@ -1690,6 +1699,19 @@ async function qualify(job:any){
  if(ce)throw ce;if(ee)throw ee;if(te)throw te;if(lee)throw lee;if(se)throw se;
  const rows=(ev??[]).filter((x:any)=>x.metadata?.active!==false);const types=new Set(rows.map((x:any)=>x.evidence_type));const triggerSummary=computeTriggerSummary(rows);const triggerScore=triggerSummary.score;
  const domain=String(c.canonical_domain||"").toLowerCase();const name=String(c.name||"");const identityTrade=explicitTradeFromIdentity(name,domain,c.trade);if(identityTrade&&c.trade!==identityTrade){await db.schema("booked_solid").from("companies").update({trade:identityTrade,updated_at:new Date().toISOString(),metadata:{...(c.metadata??{}),trade_corrected_from_identity:true,previous_trade:c.trade??null}}).eq("id",id);c.trade=identityTrade;}
+ let attributedStrategyId=job.payload.strategy_id??null;
+ const attributionGuardEnabled=true;
+ if(attributionGuardEnabled&&attributedStrategyId){
+  const {data:strategyRow,error:strategyError}=await db.schema("booked_solid").from("search_strategies").select("id,slug,trade").eq("id",attributedStrategyId).maybeSingle();
+  if(strategyError)throw strategyError;
+  if(strategyRow&&!strategyTradeCompatible(String(strategyRow.trade||"Mixed"),String(c.trade||""))){
+   const mismatchMeta={...(c.metadata??{}),strategy_attribution_valid:false,strategy_trade_mismatch:true,strategy_trade_mismatch_strategy:strategyRow.slug,strategy_trade_mismatch_strategy_trade:strategyRow.trade,strategy_trade_mismatch_company_trade:c.trade,strategy_trade_mismatch_at:new Date().toISOString()};
+   const {error:metadataError}=await db.schema("booked_solid").from("companies").update({metadata:mismatchMeta,updated_at:new Date().toISOString()}).eq("id",id);
+   if(metadataError)throw metadataError;
+   c.metadata=mismatchMeta;
+   attributedStrategyId=null;
+  }
+ }
  const badDomain=Boolean(c.metadata?.hard_excluded_source)||/reddit\.com|youtube\.com|quora\.com|facebook\.com|instagram\.com|tiktok\.com|linkedin\.com|usatoday\.com|forbes\.com|yelp\.com|angi\.com|homeadvisor\.com|thumbtack\.com|porch\.com|houzz\.com|indeed\.com|ziprecruiter\.com|glassdoor\.com|monster\.com|careerbuilder\.com|simplyhired\.com|zippia\.com|talent\.com|jooble\.org|builtin\.com|bebee\.com|vaia\.com|theladders\.com|icims\.com|jobleads\.com|lever\.co|greenhouse\.io|greenhouse\.com|workable\.com|smartrecruiters\.com|ashbyhq\.com|bamboohr\.com|jobvite\.com|trsstaffing\.com|applyboost\.ai|myquoteiq\.com|buildium\.com|funnelleasing\.com|secondnature\.com|sharefile\.com/i.test(domain);
  const badTitle=/\b(directory|directories|database|guide|best \d+|\d+ best|how to|what is|what are|do .* offer|news|magazine|article|review|reviews|jobs? in|project manager jobs|estimator jobs|recruiter|recruiting|staffing|talent acquisition|top \d+ crms?|\d+\s+ways\b|ways .* automation|ways to use automation|tasks to save time|client portals? for contractors|roofers? near me|contractors? near me)\b/i.test(name)||/^associated general contractors of\b/i.test(name);const leadgenTitle=/^(get|request|compare|find)\b.*\b(estimate|estimates|quote|quotes)\b/i.test(name);
  const text=(name+" "+String(c.normalized_name||"")+" "+rows.map((x:any)=>String(x.claim||"")+" "+String(x.snippet||"")).join(" ")).toLowerCase();
@@ -1699,7 +1721,7 @@ async function qualify(job:any){
  if(badDomain||badTitle||leadgenTitle||isVendor||unclassifiedPermitProfessional||hospitalityNonBuyer){
   await db.schema("booked_solid").from("companies").update({status:"rejected",recommended_offer:null,updated_at:new Date().toISOString()}).eq("id",id);
   await db.schema("booked_solid").from("leads").update({status:"suppressed",why_now:isVendor?"Excluded: technology/software vendor rather than an end-customer operating business.":hospitalityNonBuyer?"Excluded: hospitality property rather than a property-management operator.":"Excluded: non-prospect source.",updated_at:new Date().toISOString()}).eq("company_id",id).neq("status","won");
-  await updateStrategyLearning(job.payload.strategy_id,8,false);return {score:0,status:"rejected",reason:isVendor?"software_vendor":hospitalityNonBuyer?"hospitality_nonbuyer":leadgenTitle?"leadgen_page":unclassifiedPermitProfessional?"professional_service_nonbuyer":"non_prospect_source"};
+  await updateStrategyLearning(attributedStrategyId,8,false);return {score:0,status:"rejected",reason:isVendor?"software_vendor":hospitalityNonBuyer?"hospitality_nonbuyer":leadgenTitle?"leadgen_page":unclassifiedPermitProfessional?"professional_service_nonbuyer":"non_prospect_source"};
  }
  const contractorTrades=["HVAC","Roofing","Plumbing","Electrical","Remodeling","Painting","Fence","General Contractor","Commercial Contractor","Cabinet","Flooring","Concrete","Landscaping","Windows","Siding","Deck Builder","Home Builder","Construction"];
  const fit=contractorTrades.includes(c.trade)?25:c.trade==="Property Operations"?22:15;
@@ -1722,9 +1744,9 @@ async function qualify(job:any){
  if(computedStatus==="rejected"&&!protectedLead){
   await db.schema("booked_solid").from("companies").update({status:"rejected",recommended_offer:null,updated_at:new Date().toISOString()}).eq("id",id);
   for(const l of (existingLeads??[]).filter((x:any)=>!["sent","replied","meeting","won"].includes(String(x.status||""))))await db.schema("booked_solid").from("leads").update({status:"suppressed",why_now:why,updated_at:new Date().toISOString()}).eq("id",l.id);
-  await updateStrategyLearning(job.payload.strategy_id,20,false);return {score,offer,status:computedStatus,prospect_type:prospectType,contact_found:!!validContact};
+  await updateStrategyLearning(attributedStrategyId,20,false);return {score,offer,status:computedStatus,prospect_type:prospectType,contact_found:!!validContact};
  }
- const priorBrief=(protectedLead??priorQualified??(existingLeads??[])[0])?.lead_brief??{};const leadPayload={company_id:id,contact_id:validContact?.id??null,strategy_id:job.payload.strategy_id??null,offer,score,fit_score:fit,pain_score:pain,evidence_score:evidenceScore,contact_score:contactScore,trigger_score:triggerScore,opportunity_score:opportunityScore,priority_band:priorityBand,status,why_now:why,lead_brief:{...priorBrief,prospect_type:prospectType,evidence_types:[...types],company:c.name,website:c.website_url,contact_status:validContact?"unverified":"missing",trigger_summary:{score:triggerScore,types:triggerSummary.items.map((x:any)=>x.evidence_type),strongest_type:triggerSummary.strongest?.evidence_type||null,strongest_claim:triggerSummary.strongest?.claim||null,updated_at:new Date().toISOString()},micro_audit:{headline:triggerSummary.strongest?.claim||why,findings:triggerSummary.items.slice(0,3).map((x:any)=>({type:x.evidence_type,claim:x.claim,source_url:x.source_url,confidence:x.confidence})),generated_from_public_evidence:true},website_intelligence:c.metadata?.website_intelligence??null}};
+ const priorBrief=(protectedLead??priorQualified??(existingLeads??[])[0])?.lead_brief??{};const leadPayload={company_id:id,contact_id:validContact?.id??null,strategy_id:attributedStrategyId,offer,score,fit_score:fit,pain_score:pain,evidence_score:evidenceScore,contact_score:contactScore,trigger_score:triggerScore,opportunity_score:opportunityScore,priority_band:priorityBand,status,why_now:why,lead_brief:{...priorBrief,prospect_type:prospectType,evidence_types:[...types],company:c.name,website:c.website_url,contact_status:validContact?"unverified":"missing",trigger_summary:{score:triggerScore,types:triggerSummary.items.map((x:any)=>x.evidence_type),strongest_type:triggerSummary.strongest?.evidence_type||null,strongest_claim:triggerSummary.strongest?.claim||null,updated_at:new Date().toISOString()},micro_audit:{headline:triggerSummary.strongest?.claim||why,findings:triggerSummary.items.slice(0,3).map((x:any)=>({type:x.evidence_type,claim:x.claim,source_url:x.source_url,confidence:x.confidence})),generated_from_public_evidence:true},website_intelligence:c.metadata?.website_intelligence??null}};
  const existing=protectedLead??priorQualified??(existingLeads??[]).find((x:any)=>x.offer===offer)??(existingLeads??[])[0];let lead:any;
  if(existing){const {data:u,error:ue}=await db.schema("booked_solid").from("leads").update(leadPayload).eq("id",existing.id).select("*").single();if(ue)throw ue;lead=u;}
  else{const {data:i,error:ie}=await db.schema("booked_solid").from("leads").insert(leadPayload).select("*").single();if(ie)throw ie;lead=i;}
@@ -1748,10 +1770,10 @@ async function qualify(job:any){
    if(!(cq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:score+10+Math.min(15,triggerScore*0.15),payload:{lead_id:lead.id,company_id:id},status:"pending"});
   }
   await db.schema("booked_solid").from("companies").update({status:"qualified",recommended_offer:offer,fit_score:fit,updated_at:new Date().toISOString()}).eq("id",id);
-  await updateStrategyLearning(job.payload.strategy_id,status==="qualified"?90:70,status==="qualified"&&!priorQualified&&!protectedLead);
+  await updateStrategyLearning(attributedStrategyId,status==="qualified"?90:70,status==="qualified"&&!priorQualified&&!protectedLead);
  }else{
   await db.schema("booked_solid").from("companies").update({status:"discovered",recommended_offer:offer,fit_score:fit,updated_at:new Date().toISOString()}).eq("id",id);
-  await updateStrategyLearning(job.payload.strategy_id,50,false);
+  await updateStrategyLearning(attributedStrategyId,50,false);
  }
  return {score,offer,status,prospect_type:prospectType,contact_found:!!validContact,email_enabled:!!settings?.email_enabled,intent_bonus:intentBonus,trigger_score:triggerScore,opportunity_score:opportunityScore,priority_band:priorityBand};
 }
