@@ -1,0 +1,11 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const {stripTypeScriptTypes}=require('node:module');
+const source=fs.readFileSync(require('node:path').join(__dirname,'../supabase/functions/booked-solid-worker/index.ts'),'utf8');
+const a=source.slice(source.indexOf('function strategyTradeCompatible('),source.indexOf('async function qualify('));
+const ctx={};vm.createContext(ctx);vm.runInContext(stripTypeScriptTypes(a),ctx);
+const cases=[['Mixed','HVAC',true],['Electrical','Electrical',true],['Electrical','Remodeling',false],['Electrical','Property Operations',false],['HVAC','Plumbing',false],['Commercial HVAC','HVAC',true],['Commercial Roofing','Roofing',true],['General Contractor','Remodeling',true],['Construction','Commercial Contractor',true],['Remodeling','General Contractor',false],['Roofing','Landscaping',false],['HVAC','',true]];
+for(const [s,c,expected] of cases)assert.equal(ctx.strategyTradeCompatible(s,c),expected);
+assert(source.includes('strategy_id:attributedStrategyId,offer'));
+const qualify=source.slice(source.indexOf('async function qualify('),source.indexOf('async function message('));
+assert(!qualify.includes('updateStrategyLearning(job.payload.strategy_id,'));
+console.log('12 trade compatibility checks passed; worker learning uses validated attribution');
