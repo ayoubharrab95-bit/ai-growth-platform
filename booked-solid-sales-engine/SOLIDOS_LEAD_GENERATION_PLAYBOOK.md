@@ -162,3 +162,7 @@ Before and after strategy changes, compare:
 
 The database copy of this document is authoritative for the latest version:
 `select solidos_control.lead_generation_playbook_snapshot();`
+
+## Automatic discovery by future chats
+
+`solidos_control.system_snapshot()` now exposes an `operating_playbook` object containing the required flag, current playbook version, read function, and GitHub path. Any future agent that performs the normal SolidOS health check should therefore discover this playbook automatically before changing lead generation.
