@@ -252,3 +252,19 @@ Verified audit fixes:
 Production integrity at audit time was clean: no active duplicate jobs/domains, no orphan Leads/Contacts/Evidence, no Qualified rows below threshold, no HOT-rule violations, no suppressed selected contacts, no contact-name noise, no non-ALLOWED exploit routing, and no OSM production jobs.
 
 **Do not tune scoring, source-rights rules, or lane capacity based on this audit.** The system was actively producing Leads and Qualified prospects. Preserve v61/v116 unless rolling live evidence proves a specific regression.
+
+## Decision Maker Intelligence — Worker v118
+
+Decision-maker extraction is intentionally **precision-first**. Do not inflate coverage by accepting uncertain names.
+
+Current rules:
+- reject UI/CTA text such as `Read More`, `Learn More`, `View More`, `Click Here`, and similar labels;
+- reject role/page-fragment tokens inside a proposed name, including COO/CFO/Secretary/Vice/Finance/Qualifications/Scheduler/Superintendent and related terms;
+- reject honorific-only partial names such as `Mr. Lane`;
+- reject ordinary four-token candidates unless the fourth token is a recognized suffix (Jr/Sr/II/III/IV);
+- reject candidate names that substantially duplicate the company identity;
+- if a false person name was attached to a valid direct email/phone, preserve the contact route and remove only the false identity.
+
+Cleanup acceptance: 28 obvious false-person records were identified, 3 valid contact routes were preserved, 25 pure false contacts were suppressed, 8 Qualified leads were revalidated, and the final audit showed **0 suspicious decision-maker names** and **0 company-name-as-person cases**.
+
+Future rule: if a human name cannot be verified, keep the useful contact route and set `decision_maker_known=false`. Accuracy is more important than an artificially high decision-maker count.
