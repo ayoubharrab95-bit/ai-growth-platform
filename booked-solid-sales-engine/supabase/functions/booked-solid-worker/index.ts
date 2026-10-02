@@ -154,23 +154,40 @@ async function findPublicNamedPhone(company:any,person:any){
  return null;
 }
 
-function plausiblePersonName(name:string){
+function compactCompanyIdentity(value:string){
+ return normalize(String(value||""))
+   .replace(/\b(?:incorporated|inc|llc|ltd|limited|corp|corporation|company|co|services|service|group)\b/g," ")
+   .replace(/\s+/g," ").trim();
+}
+function plausiblePersonName(name:string,companyName=""){
  const n=String(name||"").replace(/\s+/g," ").trim();
  const parts=n.split(" ").filter(Boolean);
  if(parts.length<2||parts.length>4||n.length<5||n.length>80)return false;
- if(/\b(company|construction|contracting|roofing|plumbing|electric|electrical|hvac|services|service|team|leadership|management|solutions|group|inc|llc|corp|department|office|meet|welcome|contact|about|story|history|values|mission|career|careers|growth|work|working|why|offer|ready|start|future|positions|benefits|culture|support|mentorship|bio|coming|soon|certification|certified|gaf|master elite|operated|request|resources|technician|licensed|design build|who|we|our|the|not|every|needs|absolutely|professional|claims|repairs|alongside|app|monthly|reporting|maintenance|assistant|store|business|development|portfolio|chairman|bookkeeper|eviction|coordination|institutional|accounts|login|account|rent|collection|representation|buyers|tenant|sample|docs|referral|regional|screening|epoxy|flooring|project|wonderful|experience|owner|founder|president|manager|director|broker|plumber|master|vp|ceo|managing|partner|lease|execution|association|associations|community|communities|system|systems|county|municipal|region|district|division|water|well|wells|pump|pumps|facebook|twitter|portal|landlord|landlords|multifamily|administrative|controller|chief|financial|officer|watch|video|featured|employee|uncompromising|unwavering|quality|commitment|looks|like|show|spokane)\b/i.test(n))return false;
+ if(/\b(company|construction|contracting|roofing|plumbing|electric|electrical|hvac|services|service|team|leadership|management|solutions|group|inc|llc|corp|department|office|meet|welcome|contact|about|story|history|values|mission|career|careers|growth|work|working|why|offer|ready|start|future|positions|benefits|culture|support|mentorship|bio|coming|soon|certification|certified|gaf|master elite|operated|request|resources|technician|licensed|design build|who|we|our|the|not|every|needs|absolutely|professional|claims|repairs|alongside|app|monthly|reporting|maintenance|assistant|store|business|development|portfolio|chairman|bookkeeper|eviction|coordination|institutional|accounts|login|account|rent|collection|representation|buyers|tenant|sample|docs|referral|regional|screening|epoxy|flooring|project|wonderful|experience|owner|founder|president|manager|director|broker|plumber|master|vp|ceo|coo|cfo|cto|cio|managing|partner|lease|execution|association|associations|community|communities|system|systems|county|municipal|region|district|division|water|well|wells|pump|pumps|facebook|twitter|portal|landlord|landlords|multifamily|administrative|controller|chief|financial|finance|officer|secretary|treasurer|vice|executive|operations|marketing|sales|scheduler|superintendent|specialist|proposal|estimator|qualifications|qualification|preferred|americas|apac|emea|watch|video|featured|employee|uncompromising|unwavering|quality|commitment|looks|like|show|spokane|historical|restoration|residential|specialties|leaders)\b/i.test(n))return false;
  if(/^(?:North|South|East|West|Northern|Southern|Eastern|Western|Central)\s+(?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|Ohio|Oklahoma|Oregon|Pennsylvania|Tennessee|Texas|Utah|Vermont|Virginia|Washington|Wisconsin|Wyoming)$/i.test(n))return false;
+ if(/^(?:Mr|Mrs|Ms|Miss|Dr)\.?\s/i.test(n))return false;
  if(/\bco\.?$/i.test(n)||/\bwe['’]?re$/i.test(n)||/^i['’]m\b/i.test(n))return false;
  if(n===n.toUpperCase()&&/[A-Z]/.test(n))return false;
+ if(parts.length===4&&!/^(?:Jr\.?|Sr\.?|II|III|IV)$/i.test(parts[3]))return false;
  if(parts.length===4&&normalize(parts[0]+" "+parts[1])===normalize(parts[2]+" "+parts[3]))return false;
  if(/^(?:Do You|See All)\b/i.test(n))return false;
+ if(/^(?:Read More|Learn More|View More|See More|Click Here|Get Started|Meet Team|Our Team)$/i.test(n))return false;
+ if(companyName){
+  const pn=normalize(n),cn=compactCompanyIdentity(companyName);
+  if(pn&&cn){
+   if(pn===cn)return false;
+   const pt=pn.split(" ").filter(Boolean),ct=cn.split(" ").filter(Boolean);
+   const overlap=pt.filter((x:string)=>ct.includes(x)).length/Math.max(1,pt.length);
+   if(pt.length>=2&&overlap>=0.8)return false;
+  }
+ }
  return parts.every((x:string)=>/^[A-Z][A-Za-z'’.\-]+$/.test(x)||/^[A-Z]\.$/.test(x));
 }
-function extractWebsitePeople(pages:any[],domain:string){
+function extractWebsitePeople(pages:any[],domain:string,companyName=""){
  const found=new Map<string,any>();
  const add=(name:any,role:any,sourceUrl:string,confidence:number,htmlOrText:string)=>{
   const full=String(name||"").replace(/\s+/g," ").trim(),title=String(role||"").replace(/\s+/g," ").trim();
-  if(!plausiblePersonName(full)||decisionRoleScore(title)<=0)return;
+  if(!plausiblePersonName(full,companyName)||decisionRoleScore(title)<=0)return;
   const key=normalize(full);let email:string|null=null,phone:any=null;
   const hay=String(htmlOrText||"");
   const emails=[...new Set(hay.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[])].map((e:any)=>String(e).toLowerCase());
@@ -198,7 +215,7 @@ function extractWebsitePeople(pages:any[],domain:string){
    const headingRx=/<h[2-4][^>]*>([\s\S]*?)<\/h[2-4]>/gi;let hm:RegExpExecArray|null;
    while((hm=headingRx.exec(html))){
     const heading=clean(String(hm[1]||"")).replace(/\s+/g," ").trim();
-    if(!plausiblePersonName(heading))continue;
+    if(!plausiblePersonName(heading,companyName))continue;
     const nearby=clean(html.slice(hm.index+hm[0].length,Math.min(html.length,hm.index+hm[0].length+1100)));
     const roleMatch=nearby.match(new RegExp("\\b("+rolePart+")\\b","i"));
     if(roleMatch)add(heading,roleMatch[1],url,91,html.slice(Math.max(0,hm.index-300),Math.min(html.length,hm.index+1800)));
@@ -1314,7 +1331,7 @@ async function research(job:any){
  const domain=root.hostname.replace(/^www\./,"").toLowerCase();
  const validPages=pageResults.filter(Boolean) as any[];
  const websiteProfile=extractWebsiteProfile(validPages);
- const websitePeople=extractWebsitePeople(validPages,domain);
+ const websitePeople=extractWebsitePeople(validPages,domain,String(c.name||""));
  const missingName=!c.name||/^free |^do |^how |^what |^the best|^best /i.test(c.name);
  const missingContact=emails.size===0;let supplemental:any[]=[];
  if(ALLOW_PAID_SEARCH&&(missingName||missingContact||combined.length<500)&&Deno.env.get("TAVILY_API_KEY")){
@@ -1471,7 +1488,7 @@ async function focusedContactIntelligence(company:any){
  }catch{return null}}))).filter(Boolean) as any[];
  const finalPageMap=new Map<string,any>();for(const pg of fetchedPages){const k=String(pg.url||"").replace(/\/$/,"");if(!finalPageMap.has(k))finalPageMap.set(k,pg);}
  const pages=[...finalPageMap.values()].slice(0,10);
- const people=extractWebsitePeople(pages,domain);
+ const people=extractWebsitePeople(pages,domain,String(company.name||""));
  const emails=new Map<string,any>(),phones=new Map<string,any>();let formUrl:string|null=null;
  for(const pg of pages){
   const pageEmails=new Set<string>([
