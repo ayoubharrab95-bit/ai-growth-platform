@@ -268,3 +268,25 @@ Current rules:
 Cleanup acceptance: 28 obvious false-person records were identified, 3 valid contact routes were preserved, 25 pure false contacts were suppressed, 8 Qualified leads were revalidated, and the final audit showed **0 suspicious decision-maker names** and **0 company-name-as-person cases**.
 
 Future rule: if a human name cannot be verified, keep the useful contact route and set `decision_maker_known=false`. Accuracy is more important than an artificially high decision-maker count.
+
+## Decision Maker Role Display v7
+
+Decision Maker identity and job title are separate fields throughout the user-facing CRM/revenue views.
+
+Rules:
+- show the person name only when `contact_resolution.decision_maker_known=true`;
+- show `decision_maker_role` in a separate **Role / Title** column;
+- never concatenate title text into the person name;
+- if no verified Decision Maker exists, leave the name/title blank while preserving any valid company/direct email or phone route.
+
+Current display coverage:
+- ACTION QUEUE — Decision Maker / Contact + Role
+- QUALIFIED 360 — Decision Maker + Role
+- ALL LEADS — Decision Maker + Role / Title
+- CONTACT GAPS / CONTACTS — separate name and role fields
+- REVENUE DESK — Decision Maker + Role / Title
+- BEST TARGETS — Decision Maker + Role / Title
+
+Verified examples include **Marcus Kuhlmann — Founder**, **Gayland Looney — Owner**, **Dennis Porter — President**, and **Matt Campbell — Principal**.
+
+Known-good sheet baseline: **Sheet Sync v25 + Revenue CRM Writer v4**. This is display-only; scoring, qualification, source routing, contact extraction, and outreach remain unchanged.
