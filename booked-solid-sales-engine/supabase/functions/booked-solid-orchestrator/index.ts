@@ -63,7 +63,7 @@ function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: cors });
 }
 
-async function chooseStrategies(limit = 50, brainEnabled=false, brainPct=15) {
+async function chooseStrategies(limit = 50, brainEnabled=false, brainPct=15, balancedGrowthEnabled=false) {
   const { data, error } = await db
     .schema("booked_solid")
     .from("search_strategies")
@@ -109,7 +109,13 @@ async function chooseStrategies(limit = 50, brainEnabled=false, brainPct=15) {
       decisionAdjustment*brainConfidence -
       Math.min(12,Number(s.uses_count??0)*0.03);
 
-    const score=legacyScore*(1-brainWeight)+brainPlannerScore*brainWeight;
+    const balancedWeight=balancedGrowthEnabled?0.28:0;
+    const portfolioScore=Number(s.metadata?.brain_v21?.portfolio_score??brainPlannerScore);
+    const portfolioLane=String(s.metadata?.brain_v21?.lane??"");
+    const laneAdjustment=portfolioLane==="champion"?10:portfolioLane==="exploit"?6:portfolioLane==="challenger"?3:portfolioLane==="explore"?-12:0;
+    const portfolioPlannerScore=portfolioScore+laneAdjustment;
+    const baseScore=legacyScore*(1-brainWeight)+brainPlannerScore*brainWeight;
+    const score=baseScore*(1-balancedWeight)+portfolioPlannerScore*balancedWeight;
     return {
       ...s,
       planner_score: score,
@@ -119,6 +125,12 @@ async function chooseStrategies(limit = 50, brainEnabled=false, brainPct=15) {
       brain_decision: brainDecision,
       brain_confidence: brainConfidence,
       brain_canary:Boolean(s.metadata?.brain_v2_canary),
+      portfolio_score:Number(s.metadata?.brain_v21?.portfolio_score??0),
+      portfolio_lane:String(s.metadata?.brain_v21?.lane??""),
+      portfolio_maturity:String(s.metadata?.brain_v21?.maturity??""),
+      portfolio_weight:Number(s.metadata?.brain_v21?.allocation_weight??1),
+      portfolio_target_share:Number(s.metadata?.brain_v21?.target_share??0),
+      portfolio_expected_value:Number(s.metadata?.brain_v21?.expected_value_score??0),
       priority_yield_score: directYield,
       trade_priority_yield_score: tradeYield,
       priority_yield_sample: sample
@@ -216,7 +228,9 @@ async function planCycle(body: any) {
   const { data: settings } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).single();
   if (!settings?.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
   const brainEnabled=Boolean(settings?.strategy_brain_enabled);
-  const brainCanaryPct=Math.max(0,Math.min(50,Number(settings?.strategy_brain_canary_pct??15)));
+  const brainCanaryPct=Math.max(0,Math.min(80,Number(settings?.strategy_brain_canary_pct??15)));
+  const balancedGrowthEnabled=Boolean(settings?.balanced_growth_enabled);
+  const balancedGrowthPolicy=Number(settings?.balanced_growth_policy_version??21);
   const requestedCap=Math.max(1,Math.min(6,Number(body.limit||3)));
   const [{count:dueWork},{count:runningWork},{count:resolveBacklog},{data:osmPressureSource}]=await Promise.all([
     db.schema("booked_solid").from("work_queue")
@@ -273,14 +287,15 @@ async function planCycle(body: any) {
   const recommended=Number(pc?.recommended_limit);
   const adaptiveLimit=Number.isFinite(recommended)&&recommended>0?recommended:(dueNow>30?1:dueNow>15?2:requestedCap);
   const requestedLimit=Math.max(1,Math.min(requestedCap,adaptiveLimit));
-  const ranked = await chooseStrategies(100,brainEnabled,brainCanaryPct);
+  const ranked = await chooseStrategies(100,brainEnabled,brainCanaryPct,balancedGrowthEnabled);
   const { data: marketRows } = await db.schema("booked_solid").from("market_catalog").select("*").in("lifecycle_state",["testing","active"]);
   const { data: activeDiscover } = await db.schema("booked_solid").from("work_queue").select("payload,status").eq("kind","discover").in("status",["pending","running"]);
   const { data: recentDiscover } = await db.schema("booked_solid").from("work_queue")
     .select("payload,created_at")
     .eq("kind","discover")
     .order("created_at",{ascending:false})
-    .limit(8);
+    .limit(30);
+  const recentDiversity=(recentDiscover??[]).slice(0,8);
   const activeIds = new Set((activeDiscover ?? []).map((x:any)=>x.payload?.strategy_id).filter(Boolean));
 
   // Diversity guard: preserve performance ranking, but prevent one trade from
@@ -289,7 +304,7 @@ async function planCycle(body: any) {
   // prefer the best available strategy from another trade. If no alternative
   // exists, fall back to the normal ranked pool so discovery never stalls.
   const recentTradeCounts = new Map<string,number>();
-  for (const job of recentDiscover ?? []) {
+  for (const job of recentDiversity ?? []) {
     const trade=String(job.payload?.trade??"").trim();
     if(trade) recentTradeCounts.set(trade,(recentTradeCounts.get(trade)??0)+1);
   }
@@ -298,37 +313,72 @@ async function planCycle(body: any) {
   const selectionPool = diversified.length ? diversified : candidates;
   const diversificationApplied = Boolean(candidates.length && selectionPool.length && candidates[0]?.id!==selectionPool[0]?.id);
 
-  // Rolling 70/30 exploit/explore allocation. This keeps the ratio near
-  // 70/30 even when backpressure shrinks a planner cycle to only 1-2 jobs.
+  // Balanced Growth v2.1 portfolio allocation.
+  // Exploration stays alive, but varies between 20-30% based on available capacity.
   const recentModes=(recentDiscover??[])
     .map((x:any)=>String(x.payload?.priority_selection_mode||""))
     .filter((x:string)=>x==="exploit"||x==="explore");
   const recentExplore=recentModes.filter((x:string)=>x==="explore").length;
+  const recentStrategyCounts=new Map<string,number>();
+  const recentSourceCounts=new Map<string,number>();
+  for(const job of recentDiscover??[]){
+    const id=String(job.payload?.strategy_id||"");
+    if(id)recentStrategyCounts.set(id,(recentStrategyCounts.get(id)??0)+1);
+    const sourceSlug=String(job.payload?.source_slug||"");
+    if(sourceSlug)recentSourceCounts.set(sourceSlug,(recentSourceCounts.get(sourceSlug)??0)+1);
+  }
+
+  const arrivalRatio=Number(pc?.arrival_completion_ratio||0);
+  const downstreamDue=Number(pc?.downstream_due||0);
+  const discoveryDue=Number(pc?.discovery_due||0);
+  let explorationPct=0.25;
+  if(Boolean(pc?.throttle)||arrivalRatio>1.08||downstreamDue>2||discoveryDue>4)explorationPct=0.20;
+  else if(!Boolean(pc?.throttle)&&downstreamDue===0&&arrivalRatio<=0.98&&discoveryDue<=1)explorationPct=0.30;
+
   const projectedTotal=recentModes.length+requestedLimit;
-  const targetExplore=Math.round(projectedTotal*0.30);
-  const maxExplore=requestedLimit;
-  const exploreN=Math.max(0,Math.min(maxExplore,targetExplore-recentExplore));
+  const targetExplore=Math.round(projectedTotal*explorationPct);
+  const exploreN=Math.max(0,Math.min(requestedLimit,targetExplore-recentExplore));
   const exploitN=Math.max(0,requestedLimit-exploreN);
-  const exploitPool=selectionPool.filter((x:any)=>!x.brain_canary||x.brain_decision==="exploit");
+
+  const portfolioRank=(x:any,pool:any[])=>{
+    if(!balancedGrowthEnabled)return Number(x.planner_score||0);
+    const weight=Math.max(0.1,Number(x.portfolio_weight||1));
+    const totalWeight=Math.max(0.1,pool.reduce((a:number,v:any)=>a+Math.max(0.1,Number(v.portfolio_weight||1)),0));
+    const targetRecent=Math.max(0.5,(recentDiscover?.length||30)*(weight/totalWeight));
+    const actual=Number(recentStrategyCounts.get(String(x.id))||0);
+    const deficit=targetRecent-actual;
+    const lane=String(x.portfolio_lane||"");
+    const laneBoost=lane==="champion"?12:lane==="exploit"?8:lane==="challenger"?4:lane==="explore"?-10:0;
+    return Number(x.planner_score||0)+deficit*9+laneBoost+Number(x.portfolio_expected_value||0)*0.08;
+  };
+
+  const exploitPool=selectionPool
+    .filter((x:any)=>!x.brain_canary||x.brain_decision==="exploit"||["champion","exploit"].includes(String(x.portfolio_lane||"")))
+    .filter((x:any)=>String(x.portfolio_lane||"")!=="explore");
+  const exploitSorted=[...exploitPool].sort((a:any,b:any)=>portfolioRank(b,exploitPool)-portfolioRank(a,exploitPool));
   const exploit = exploitN>0
-    ? exploitPool.slice(0,exploitN).map((x:any)=>({...x,priority_selection_mode:"exploit"}))
+    ? exploitSorted.slice(0,exploitN).map((x:any)=>({...x,priority_selection_mode:"exploit"}))
     : [];
-  const exploitIds = new Set(exploit.map((x:any)=>x.id));
-  const exploration = selectionPool
-    .filter((x:any)=>!exploitIds.has(x.id))
+
+  const exploitIds=new Set(exploit.map((x:any)=>x.id));
+  const explorePool=selectionPool.filter((x:any)=>!exploitIds.has(x.id)&&x.brain_decision!=="deprioritize");
+  const exploration = [...explorePool]
     .sort((a:any,b:any)=>{
       const rank=(x:any)=>{
         const age=x.last_used_at?Math.min(36,(Date.now()-new Date(x.last_used_at).getTime())/3600000):36;
-        const lowSample=Math.max(0,8-Number(x.priority_yield_sample||0))*3;
-        const brainDecision=String(x.brain_decision||"test");
-        const negativePenalty=brainDecision==="deprioritize"?70:0;
-        const canaryBoost=x.brain_canary&&brainDecision==="test"?10:0;
-        return Number(x.exploration_weight||1)*18 + age + lowSample + canaryBoost - negativePenalty;
+        const lowSample=Math.max(0,8-Number(x.priority_yield_sample||0))*2;
+        const lane=String(x.portfolio_lane||"");
+        const laneBoost=lane==="challenger"?18:lane==="learning"?10:lane==="champion"?-8:lane==="explore"?-4:0;
+        const maturity=String(x.portfolio_maturity||"");
+        const maturityBoost=maturity==="warming"?12:maturity==="learning"?7:0;
+        const canaryBoost=x.brain_canary?8:0;
+        return portfolioRank(x,explorePool)+age*0.35+lowSample+laneBoost+maturityBoost+canaryBoost;
       };
       return rank(b)-rank(a);
     })
     .slice(0,exploreN)
     .map((x:any)=>({...x,priority_selection_mode:"explore"}));
+
   const selected=[...exploit,...exploration].slice(0,requestedLimit);
   const strategies = selected.map((s:any)=>({...s,target_location:marketFor(s,marketRows??[],brainEnabled,brainCanaryPct)}));
   const { data: allEnabledSources } = await db.schema("booked_solid").from("source_catalog").select("*").eq("enabled",true);
@@ -351,24 +401,46 @@ async function planCycle(body: any) {
   const citySources=[chicagoPermitSource,nycPermitSource,austinPermitSource,seattlePermitSource,bostonPermitSource,sfPermitSource,philadelphiaPermitSource,philadelphiaTradeLicenseSource,denverPermitSource].filter(Boolean);
   const sourceLeadYield=(x:any)=>Number(x?.metadata?.lead_yield?.score??0);
   const sourceDiscoveryTier=(x:any)=>{
+    const rights=String(x?.metadata?.source_v22?.rights_status??x?.metadata?.brain_v2?.rights_status??"");
+    const recoveryLane=String(x?.metadata?.source_v22?.portfolio_lane??"");
     const brainLane=String(x?.metadata?.brain_v2?.lane??"");
+    if(rights==="BLOCKED"||rights==="INTERNAL_ONLY"||brainLane==="blocked")return "blocked";
+    if(rights==="REVIEW_REQUIRED")return "exploration_only";
+    if(rights==="ALLOWED"&&recoveryLane==="champion")return "proven";
+    if(rights==="ALLOWED"&&recoveryLane==="challenger")return "testing";
+    if(rights==="ALLOWED"&&recoveryLane==="exploration")return "exploration_only";
     if(brainLane==="proven")return "proven";
     if(brainLane==="testing")return "testing";
     if(brainLane==="exploration")return "exploration_only";
-    if(brainLane==="blocked")return "blocked";
     return String(x?.metadata?.discovery_tier??x?.metadata?.lead_yield?.tier??"testing");
   };
   const sourceRankValue=(x:any)=>{
     const life=x?.lifecycle_state==="active"?35:15;
-    const quality=Number(x?.quality_score||50)*0.25;
-    const leadYield=sourceLeadYield(x)*0.75;
-    const priorityYield=Number(x?.metadata?.priority_yield_score||0)*0.10;
-    const exploration=Number(x?.exploration_weight||1)*2;
+    const quality=Number(x?.quality_score||50)*0.20;
+    const leadYield=sourceLeadYield(x)*0.55;
+    const priorityYield=Number(x?.metadata?.priority_yield_score||0)*0.08;
+    const exploration=Number(x?.exploration_weight||1)*1.5;
     const brain=Number(x?.metadata?.brain_v2?.score??0);
     const brainLane=String(x?.metadata?.brain_v2?.lane??"");
     const zeroGuard=Boolean(x?.metadata?.brain_v2?.zero_yield_guard);
-    const laneBoost=brainLane==="proven"?18:brainLane==="testing"?5:brainLane==="exploration"?-8:brainLane==="blocked"?-100:0;
-    return life+quality+leadYield+priorityYield+exploration+brain*0.55+laneBoost-(zeroGuard?25:0);
+    const v22=x?.metadata?.source_v22??{};
+    const sourceValue=Number(v22?.source_value_score??0);
+    const commercialYield=Number(v22?.commercial_yield_score??0);
+    const recoveryLane=String(v22?.portfolio_lane??"");
+    const recommendedShare=Math.max(0,Number(v22?.recommended_share_pct??0));
+    const actualRecent=Number(recentSourceCounts.get(String(x?.slug||""))||0);
+    const targetRecent=(recentDiscover?.length||30)*(recommendedShare/100);
+    const shareDeficit=Math.max(-3,Math.min(3,targetRecent-actualRecent));
+    const rights=String(v22?.rights_status??x?.metadata?.brain_v2?.rights_status??"");
+    const laneBoost=
+      recoveryLane==="champion"?24:
+      recoveryLane==="challenger"?10:
+      recoveryLane==="exploration"?-10:
+      brainLane==="proven"?12:brainLane==="testing"?4:brainLane==="exploration"?-8:brainLane==="blocked"?-100:0;
+    const rightsPenalty=rights==="REVIEW_REQUIRED"?25:rights==="BLOCKED"?100:0;
+    return life+quality+leadYield+priorityYield+exploration+brain*0.30
+      +sourceValue*0.50+commercialYield*0.20+laneBoost+shareDeficit*6
+      -(zeroGuard?25:0)-rightsPenalty;
   };
   const autoActiveSources=(sources??[])
     .filter((x:any)=>["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||""))&&["active","canary"].includes(String(x.lifecycle_state||"")))
@@ -405,13 +477,34 @@ async function planCycle(body: any) {
   const discoveryCapable=(source:any,trade:string,market:string)=>{
     if(!source)return false;
     const slug=String(source.slug||"");
+    const sourcePurpose=(slug+" "+String(source.name||"")+" "+String(source.metadata?.source_kind||"")).toLowerCase();
+    if(trade==="Property Operations"
+       && /(permit|dob|contractor license|trade license)/.test(sourcePurpose)
+       && !/(property management|property operations|housing|multifamily|rental)/.test(sourcePurpose))return false;
     if(slug==="openstreetmap_overpass")return osmTrades.has(trade);
     if(slug==="nrca_official")return ["Roofing","Commercial Roofing"].includes(trade);
     if(slug==="usaspending_api")return true;
     const adapter=String(source.metadata?.adapter||"");
     if(["generic_socrata","generic_arcgis"].includes(adapter)){
-      const sm=String(source.metadata?.market_hint||source.metadata?.market||"");
-      return (!sm||sm===market)&&tradeCompatible(source,trade);
+      const sourceKind=String(source.metadata?.source_kind||"permit").toLowerCase();
+      if(trade==="Property Operations"&&!/(property|rental|management|multifamily|housing)/.test(sourceKind+" "+String(source.name||"").toLowerCase()))return false;
+      const sm=String(source.metadata?.market_hint||source.metadata?.market||"").trim();
+      const jurisdiction=String(source.metadata?.jurisdiction_state||"").trim().toUpperCase();
+      const fm=source.metadata?.field_map??{};
+      const hasRowGeo=Boolean(fm.city||fm.state);
+      if(!sm&&!hasRowGeo&&!jurisdiction)return false;
+      if(sm&&sm!==market)return false;
+      if(jurisdiction){
+        const m=String(market||"").trim();
+        const stateMatch=m.match(/\b([A-Z]{2})\b/);
+        const stateCode=stateMatch?stateMatch[1].toUpperCase():
+          m==="Washington"?"WA":m==="Maryland"?"MD":m==="New Jersey"?"NJ":m==="California"?"CA":m==="Texas"?"TX":
+          m==="Florida"?"FL":m==="Arizona"?"AZ":m==="Pennsylvania"?"PA":m==="Ohio"?"OH":m==="Virginia"?"VA":
+          m==="North Carolina"?"NC":m==="South Carolina"?"SC":m==="Georgia"?"GA":m==="Colorado"?"CO":m==="Oregon"?"OR":"";
+        if(stateCode&&stateCode!==jurisdiction)return false;
+        if(!stateCode&&m!=="US"&&m!=="United States")return false;
+      }
+      return tradeCompatible(source,trade);
     }
     const sm=String(source.metadata?.market_hint||source.metadata?.market||"");
     if(citySources.some((x:any)=>x?.slug===slug))return Boolean(sm)&&sm===market;
@@ -440,43 +533,83 @@ async function planCycle(body: any) {
       return sample<20||leads>0;
     });
     const exploration=ranked.filter((x:any)=>sourceDiscoveryTier(x)==="exploration_only");
+    const freshExploration=exploration.filter((x:any)=>!Boolean(x?.metadata?.brain_v2?.zero_yield_guard));
+    const zeroYieldExploration=exploration.filter((x:any)=>Boolean(x?.metadata?.brain_v2?.zero_yield_guard));
     const strategyMode=String(s.priority_selection_mode||"exploit");
     const bucket=hashText(String(s.slug)+":brain-source:"+useCount)%100;
     let pool:any[]=[];
     let lane="proven";
 
     if(strategyMode==="exploit"){
-      // Never spend exploit capacity on an exploration-only source.
       if(proven.length){ lane="proven"; pool=proven; }
       else if(testing.length){ lane="testing"; pool=testing; }
       else return null;
     }else{
-      // Exploration jobs are the only place where mature zero-yield/new sources may be tested.
       if(bucket<35 && proven.length){ lane="proven"; pool=proven; }
       else if(bucket<65 && testing.length){ lane="testing"; pool=testing; }
-      else if(exploration.length){ lane="exploration"; pool=exploration; }
-      else if(testing.length){ lane="testing"; pool=testing; }
-      else { lane="proven"; pool=proven; }
+      else{
+        lane="exploration";
+        const zeroYieldBucket=hashText(String(s.slug)+":"+market+":zero-yield:"+useCount)%100;
+        if(zeroYieldBucket<12&&zeroYieldExploration.length)pool=zeroYieldExploration;
+        else if(freshExploration.length)pool=freshExploration;
+        else if(exploration.length)pool=exploration;
+        else if(testing.length){ lane="testing"; pool=testing; }
+        else { lane="proven"; pool=proven; }
+      }
     }
 
     if(!pool.length)return null;
-    const top=lane==="exploration"?pool:pool.slice(0,Math.max(1,Math.ceil(pool.length*0.40)));
+    const top=lane==="exploration"
+      ? pool.slice(0,Math.max(1,Math.ceil(pool.length*0.60)))
+      : pool.slice(0,Math.max(1,Math.ceil(pool.length*0.40)));
     return top[hashText(String(s.slug)+":"+market+":"+lane+":"+useCount)%top.length];
   };
   if (!strategies.length) {
     return json({ ok: true, paused: true, reason: "no_strategy_available" }, 200);
   }
 
+  const marketRankValue=(m:any)=>{
+    const legacy=Number(m?.quality_score||50)+Number(m?.exploration_weight||1)*7+Number(m?.metadata?.priority_yield_score||25)*0.35;
+    const brain=Number(m?.metadata?.brain_v2?.score??legacy);
+    const decision=String(m?.metadata?.brain_v2?.decision??"test");
+    return legacy*0.72+brain*0.28+(decision==="exploit"?8:decision==="deprioritize"?-12:0);
+  };
   const routed = strategies.map((s:any)=>{
     const useCount=Number(s.uses_count??0);
-    const trade=String(s.trade||"Mixed"),market=String(s.target_location||"US");
-    let source:any=chooseBaseSource(s);
-    if(!source)return null;
+    const trade=String(s.trade||"Mixed");
+    let market=String(s.target_location||"US");
+    let routedStrategy={...s,target_location:market};
+    let source:any=chooseBaseSource(routedStrategy);
 
+    // If the selected market has no compatible source, preserve the strategy
+    // and safely reroute it to the best source-compatible market instead of
+    // falling back to an unrelated local dataset or dropping the whole cycle.
+    if(!source){
+      const rankedMarkets=[...(marketRows??[])]
+        .filter((m:any)=>["testing","active"].includes(String(m.lifecycle_state||"active")))
+        .sort((a:any,b:any)=>marketRankValue(b)-marketRankValue(a));
+      const rotated=rankedMarkets.length
+        ? rankedMarkets.slice(hashText(String(s.slug)+":"+useCount)%rankedMarkets.length)
+            .concat(rankedMarkets.slice(0,hashText(String(s.slug)+":"+useCount)%rankedMarkets.length))
+        : [];
+      for(const m of rotated){
+        const candidate=String(m.display_name||"");
+        if(!candidate||candidate===market)continue;
+        const attempt={...s,target_location:candidate};
+        const candidateSource=chooseBaseSource(attempt);
+        if(candidateSource&&discoveryCapable(candidateSource,trade,candidate)){
+          market=candidate;
+          routedStrategy=attempt;
+          source=candidateSource;
+          break;
+        }
+      }
+    }
+    if(!source)return null;
     if(!discoveryCapable(source,trade,market))return null;
     const jobMarket=String(source?.metadata?.market_hint||source?.metadata?.market||market);
     const [jobLat,jobLon]=coordsFor(jobMarket,marketRows??[]);
-    return {strategy:s,job:{
+    return {strategy:routedStrategy,job:{
       kind:"discover",
       priority:Math.max(1,Number(s.planner_score)),
       payload:{
@@ -500,7 +633,20 @@ async function planCycle(body: any) {
         brain_strategy_score:Number(s.brain_score??0),
         brain_strategy_decision:String(s.brain_decision??"legacy"),
         brain_source_score:Number(source?.metadata?.brain_v2?.score??0),
-        brain_source_lane:String(source?.metadata?.brain_v2?.lane??sourceDiscoveryTier(source)),
+        brain_source_lane:String(sourceDiscoveryTier(source)),
+        source_recovery_policy:22,
+        source_portfolio_lane:String(source?.metadata?.source_v22?.portfolio_lane??""),
+        source_value_score:Number(source?.metadata?.source_v22?.source_value_score??0),
+        source_commercial_yield_score:Number(source?.metadata?.source_v22?.commercial_yield_score??0),
+        source_recommended_share_pct:Number(source?.metadata?.source_v22?.recommended_share_pct??0),
+        source_rights_status:String(source?.metadata?.source_v22?.rights_status??source?.metadata?.brain_v2?.rights_status??""),
+        balanced_growth_policy:balancedGrowthEnabled?balancedGrowthPolicy:0,
+        portfolio_lane:String(s.portfolio_lane||""),
+        portfolio_maturity:String(s.portfolio_maturity||""),
+        portfolio_score:Number(s.portfolio_score||0),
+        portfolio_weight:Number(s.portfolio_weight||1),
+        portfolio_target_share:Number(s.portfolio_target_share||0),
+        exploration_pct:explorationPct,
         evolution_source:Boolean(source?.metadata?.discovered_by==="self_evolution")
       },
       status:"pending",
@@ -570,6 +716,14 @@ async function planCycle(body: any) {
       rollout:"blended_canary",
       source_zero_yield_guard:true
     },
+    balanced_growth:{
+      enabled:balancedGrowthEnabled,
+      policy_version:balancedGrowthPolicy,
+      exploration_pct:explorationPct,
+      portfolio_allocator:true,
+      unknown_market_generic_sources_blocked:true,
+      hard_safety_unchanged:true
+    },
     diversity: {
       recent_window_cycles: 8,
       max_attempts_per_trade: 3,
@@ -588,6 +742,11 @@ async function planCycle(body: any) {
       brain_planner_score:s.brain_planner_score,
       brain_score:s.brain_score,
       brain_decision:s.brain_decision,
+      portfolio_lane:s.portfolio_lane,
+      portfolio_maturity:s.portfolio_maturity,
+      portfolio_score:s.portfolio_score,
+      portfolio_weight:s.portfolio_weight,
+      portfolio_target_share:s.portfolio_target_share,
       priority_selection_mode: s.priority_selection_mode||"exploit",
       priority_yield_score: s.priority_yield_score,
       trade_priority_yield_score: s.trade_priority_yield_score,
