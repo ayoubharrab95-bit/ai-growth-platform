@@ -686,7 +686,7 @@ async function planCycle(body: any) {
     if(!discoveryCapable(source,trade,market))return null;
     const jobMarket=String(source?.metadata?.market_hint||source?.metadata?.market||market);
     const [jobLat,jobLon]=coordsFor(jobMarket,marketRows??[]);
-    return {strategy:routedStrategy,job:{
+    return {strategy:routedStrategy,source,job:{
       kind:"discover",
       priority:Math.max(1,Number(s.planner_score)),
       payload:{
@@ -733,18 +733,33 @@ async function planCycle(body: any) {
 
   const routedExploit=routed.filter((x:any)=>String(x.strategy?.priority_selection_mode||"")==="exploit");
   const routedExplore=routed.filter((x:any)=>String(x.strategy?.priority_selection_mode||"")==="explore");
-  const finalRouted:any[]=[
+  const preferredRouted:any[]=[
     ...routedExploit.slice(0,exploitN),
     ...routedExplore.slice(0,exploreN)
   ];
-  const finalIds=new Set(finalRouted.map((x:any)=>String(x.strategy?.id||"")));
-  if(finalRouted.length<requestedLimit){
-    for(const x of routed){
-      const id=String(x.strategy?.id||"");
-      if(finalIds.has(id))continue;
-      finalRouted.push(x); finalIds.add(id);
-      if(finalRouted.length>=requestedLimit)break;
-    }
+
+  const isMatureZeroYieldSource=(x:any)=>{
+    const source=x?.source;
+    const sample=Number(source?.metadata?.brain_v2?.sample??source?.metadata?.lead_yield?.sample??0);
+    const leads=Number(source?.metadata?.brain_v2?.leads??source?.metadata?.lead_yield?.leads??0);
+    return Boolean(source?.metadata?.brain_v2?.zero_yield_guard)
+      || (sourceDiscoveryTier(source)==="exploration_only"&&sample>=20&&leads===0);
+  };
+
+  // Keep source exploration alive, but never allow mature zero-yield sources
+  // to consume more than one slot in a single planner cycle.
+  const finalRouted:any[]=[];
+  const finalIds=new Set<string>();
+  let matureZeroYieldUsed=0;
+  for(const x of [...preferredRouted,...routed]){
+    const id=String(x.strategy?.id||"");
+    if(!id||finalIds.has(id))continue;
+    const matureZero=isMatureZeroYieldSource(x);
+    if(matureZero&&matureZeroYieldUsed>=1)continue;
+    finalRouted.push(x);
+    finalIds.add(id);
+    if(matureZero)matureZeroYieldUsed++;
+    if(finalRouted.length>=requestedLimit)break;
   }
 
   if(!finalRouted.length){
@@ -803,6 +818,7 @@ async function planCycle(body: any) {
       routing_candidates:strategies.length,
       routable_candidates:routed.length,
       queued_after_routing:queued?.length??0,
+      mature_zero_yield_cycle_cap:1,
       cooling_sources: coolingSources.slice(0,8).map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
     },
     strategy_brain:{
