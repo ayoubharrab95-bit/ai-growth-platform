@@ -424,6 +424,7 @@ async function writeTab(id:string,sm:any,name:string,rows:any[][],token:string,m
 }
 async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any={}){
   const identityGuard=true;
+  const courtneyStrengthFirst=true;
   const displayName=(cr:any)=>identityGuard?(cr.decision_maker_known?(cr.decision_maker_name||""):""):(cr.decision_maker_name||cr.recipient_name||"");
   const displayRole=(cr:any)=>identityGuard?(cr.decision_maker_known?(cr.decision_maker_role||""):""):(cr.decision_maker_role||cr.recipient_role||"");
   const id=TARGETS.CORE_CRM.id;
@@ -591,6 +592,7 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
     .slice()
     .sort((a:any,b:any)=>
       readinessRank(b.rev?.readiness)-readinessRank(a.rev?.readiness) ||
+      (courtneyStrengthFirst?priRank(b.l?.priority_band)-priRank(a.l?.priority_band):0) ||
       Number(b.rev?.target_score||0)-Number(a.rev?.target_score||0) ||
       priRank(b.l?.priority_band)-priRank(a.l?.priority_band) ||
       Number(b.l?.opportunity_score||0)-Number(a.l?.opportunity_score||0)
@@ -977,7 +979,7 @@ async function syncPending(token:string){
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v33",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v35",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
