@@ -1400,17 +1400,27 @@ function extractMailtoEmails(html:string,domain:string){
  }
  return [...out];
 }
-function extractContactFormUrl(html:string,pageUrl:string,root:URL){
+function contactPageUrl(value:string,pageUrl:string,root:URL){
+ try{
+  const u=new URL(value,pageUrl);
+  if(u.origin!==root.origin||!/^https?:$/.test(u.protocol))return null;
+  if(/\.(?:css|js|mjs|map|json|xml|pdf|jpg|jpeg|png|gif|svg|webp|ico|woff2?|ttf|zip|docx?|xlsx?)(?:$)/i.test(u.pathname))return null;
+  if(/\/(?:wp-content|wp-includes|wp-json|assets|static)\//i.test(u.pathname))return null;
+  if(/wp-login|wp-admin|postpass|login|logout|password/i.test(u.pathname+u.search))return null;
+  return u.toString();
+ }catch{return null;}
+}
+function extractContactFormUrl(html:string,pageUrl:string,root:URL,safePages=false){
  const raw=String(html||"");
  const pagePath=(()=>{try{return new URL(pageUrl).pathname}catch{return ""}})();
- if(/<form\b/i.test(raw)&&/(contact|estimate|quote|schedule|book|request)/i.test(pagePath))return pageUrl;
+ if(/<form\b/i.test(raw)&&/(contact|estimate|quote|schedule|book|request)/i.test(pagePath))return safePages?contactPageUrl(pageUrl,pageUrl,root):pageUrl;
  const candidates:string[]=[];
  const formRx=/<form[^>]*\baction\s*=\s*["']([^"']*)["'][^>]*>/gi;let fm:RegExpExecArray|null;
  while((fm=formRx.exec(raw))){const x=String(fm[1]||"").trim();if(x)candidates.push(x);}
  for(const href of extractHrefValues(raw))if(/contact|estimate|quote|schedule|book|request/i.test(href))candidates.push(href);
  for(const x of candidates){
   if(/wp-login|wp-admin|postpass|login|logout|password/i.test(x))continue;
-  try{const u=new URL(x,pageUrl);if(u.origin===root.origin&&/^https?:$/.test(u.protocol)&&/(contact|estimate|quote|schedule|book|request)/i.test(u.pathname+u.search))return u.toString();}catch{}
+  try{const u=new URL(x,pageUrl);if(safePages&&!contactPageUrl(x,pageUrl,root))continue;if(u.origin===root.origin&&/^https?:$/.test(u.protocol)&&/(contact|estimate|quote|schedule|book|request)/i.test(u.pathname+u.search))return u.toString();}catch{}
  }
  return null;
 }
@@ -1429,7 +1439,7 @@ function contactIntelUrlHint(value:string){
  return /(?:^|[-_/])(team|staff|leadership|management|owner|founder|president|executive|director|meet)(?:[-_/]|$)/i.test(s)
    || /(?:^|\/)(about|company|who-we-are|our-story|contact|contact-us)(?:\/|$)/i.test(s);
 }
-async function focusedContactIntelligence(company:any){
+async function focusedContactIntelligence(company:any,safeForms=false){
  if(!company?.website_url)return {version:2,pages:0,people:[],emails:[],phones:[],contact_form_url:null};
  let root:URL;try{root=new URL(company.website_url)}catch{return {version:2,pages:0,people:[],emails:[],phones:[],contact_form_url:null}}
  const domain=String(company.canonical_domain||root.hostname.replace(/^www\./,"")).toLowerCase();
@@ -1502,7 +1512,7 @@ async function focusedContactIntelligence(company:any){
   for(const ph of [...extractPhoneCandidates(pg.visible,pg.url,pg.p),...extractVanityPhones(pg.visible,pg.url)]){
    const prev=phones.get(ph.phone);if(!prev||Number(ph.phone_confidence)>Number(prev.phone_confidence))phones.set(ph.phone,ph);
   }
-  if(!formUrl)formUrl=extractContactFormUrl(pg.h,pg.url,root);
+  if(!formUrl)formUrl=extractContactFormUrl(pg.h,pg.url,root,safeForms);
  }
  // Link only actually published direct emails to a person when the email pattern matches that public name.
  for(const person of people){
@@ -1552,8 +1562,9 @@ async function contactResolve(job:any){
  const {data:raw,error:ce}=await db.schema("booked_solid").from("contacts").select("*").eq("company_id",company.id).neq("status","suppressed");if(ce)throw ce;
  let contacts=(raw??[]).filter((x:any)=>x.status!=="invalid");
  let contactIntel:any=null;
+ const formGuardEnabled=true;
  if(Number(company.metadata?.contact_intelligence_version||0)<2||job.payload?.force_contact_intelligence_v2===true){
-  try{contactIntel=await focusedContactIntelligence(company);contacts=(await persistFocusedContactIntelligence(company,contactIntel,contacts)).filter((x:any)=>x.status!=="invalid"&&x.status!=="suppressed");}catch(e){contactIntel={version:2,error:e instanceof Error?e.message:String(e)};}
+  try{contactIntel=await focusedContactIntelligence(company,formGuardEnabled);contacts=(await persistFocusedContactIntelligence(company,contactIntel,contacts)).filter((x:any)=>x.status!=="invalid"&&x.status!=="suppressed");}catch(e){contactIntel={version:2,error:e instanceof Error?e.message:String(e)};}
  }
  const named=[...contacts].filter((x:any)=>x.full_name).sort((a:any,b:any)=>(decisionRoleScore(b.role)-decisionRoleScore(a.role))||(contactResolutionScore(b)-contactResolutionScore(a)));
  const decisionMakers=named.filter((x:any)=>decisionRoleScore(x.role)>0);
@@ -1615,7 +1626,9 @@ async function contactResolve(job:any){
  const phoneContacts=contacts.filter((x:any)=>x.phone&&x.phone_status!=="invalid");
  const decisionPhone=phoneContacts.filter((x:any)=>x.full_name&&decisionRoleScore(x.role)>0&&x.phone_type==="decision_maker_public").sort((a:any,b:any)=>Number(b.phone_confidence||0)-Number(a.phone_confidence||0))[0];
  const chosenPhone=decisionPhone??(chosen?.phone?chosen:phoneContacts.sort((a:any,b:any)=>Number(b.phone_confidence||0)-Number(a.phone_confidence||0))[0]??null);
- const publicForm=contactIntel?.contact_form_url??company.metadata?.contact_intelligence?.contact_form_url??null;
+ const rawPublicForm=contactIntel?.contact_form_url??company.metadata?.contact_intelligence?.contact_form_url??null;
+ let publicForm=rawPublicForm;
+ if(formGuardEnabled&&rawPublicForm){try{const root=new URL(company.website_url);publicForm=contactPageUrl(rawPublicForm,root.toString(),root);}catch{publicForm=null;}}
  if(!chosen&&decisionPhone){contactClass="decision_maker_phone";score=Math.max(score,60);}
  else if(!chosen&&decision&&publicForm){contactClass="decision_maker_contact_form";score=Math.max(score,45);}
  else if(!chosen&&publicForm){contactClass="public_contact_form";score=Math.max(score,30);}
