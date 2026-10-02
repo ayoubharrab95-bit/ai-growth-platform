@@ -30,12 +30,20 @@ function sourceCooling(s:any){
  const t=new Date(String(raw)).getTime();
  return Number.isFinite(t)&&t>Date.now();
 }
-function marketFor(s:any,marketRows:any[]=[]){
+function marketFor(s:any,marketRows:any[]=[],brainEnabled=false,brainPct=15){
  if(s.geography&&s.geography!=="US")return s.geography;
  const live=(marketRows??[]).filter((m:any)=>["testing","active"].includes(String(m.lifecycle_state||"active"))&&Number.isFinite(Number(m.latitude))&&Number.isFinite(Number(m.longitude)));
  if(live.length){
+   const brainWeight=brainEnabled?Math.max(0,Math.min(0.50,Number(brainPct||15)/100)):0;
    const ranked=[...live].sort((a:any,b:any)=>{
-     const rank=(x:any)=>Number(x.quality_score||50)+Number(x.exploration_weight||1)*7+Number(x.metadata?.priority_yield_score||25)*0.35;
+     const rank=(x:any)=>{
+       const legacy=Number(x.quality_score||50)+Number(x.exploration_weight||1)*7+Number(x.metadata?.priority_yield_score||25)*0.35;
+       const brainScore=Number(x.metadata?.brain_v2?.score??legacy);
+       const decision=String(x.metadata?.brain_v2?.decision??"test");
+       const decisionAdj=decision==="exploit"?6:decision==="deprioritize"?-10:0;
+       const brainRank=brainScore+decisionAdj;
+       return legacy*(1-brainWeight)+brainRank*brainWeight;
+     };
      return rank(b)-rank(a);
    });
    const explore=(hashText(String(s.slug)+":"+String(s.uses_count??0))%100)<30;
@@ -55,7 +63,7 @@ function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: cors });
 }
 
-async function chooseStrategies(limit = 50) {
+async function chooseStrategies(limit = 50, brainEnabled=false, brainPct=15) {
   const { data, error } = await db
     .schema("booked_solid")
     .from("search_strategies")
@@ -66,10 +74,8 @@ async function chooseStrategies(limit = 50) {
 
   if (error) throw error;
 
-  // Priority Yield Engine v1:
-  // exploitation is driven by proven strategy/trade HOT+HIGH yield while
-  // exploration weight and staleness keep new strategies from being starved.
   const now = Date.now();
+  const brainWeight=brainEnabled?Math.max(0,Math.min(0.50,Number(brainPct||15)/100)):0;
   const ranked = (data ?? []).map((s: any) => {
     const ageHours = s.last_used_at
       ? Math.max(0, (now - new Date(s.last_used_at).getTime()) / 3600000)
@@ -83,15 +89,36 @@ async function chooseStrategies(limit = 50) {
     const yieldBoost =
       ((directYield - 25) * 0.35 * confidence) +
       ((tradeYield - 25) * 0.18);
-    const score =
+    const legacyScore =
       Number(s.performance_score ?? 50) +
       explorationBoost +
       freshnessBoost +
       yieldBoost -
       Math.min(20, Number(s.uses_count ?? 0) * 0.05);
+
+    const brain= s.metadata?.brain_v2 ?? {};
+    const brainScore=Number(brain?.score ?? s.performance_score ?? 50);
+    const brainDecision=String(brain?.decision ?? "test");
+    const brainConfidence=Number(brain?.confidence ?? 0);
+    const decisionAdjustment=brainDecision==="exploit"?8:brainDecision==="deprioritize"?-18:0;
+    const brainPlannerScore=
+      brainScore +
+      freshnessBoost*0.35 +
+      explorationBoost*0.35 +
+      yieldBoost*0.25 +
+      decisionAdjustment*brainConfidence -
+      Math.min(12,Number(s.uses_count??0)*0.03);
+
+    const score=legacyScore*(1-brainWeight)+brainPlannerScore*brainWeight;
     return {
       ...s,
       planner_score: score,
+      legacy_planner_score: legacyScore,
+      brain_planner_score: brainPlannerScore,
+      brain_score: brainScore,
+      brain_decision: brainDecision,
+      brain_confidence: brainConfidence,
+      brain_canary:Boolean(s.metadata?.brain_v2_canary),
       priority_yield_score: directYield,
       trade_priority_yield_score: tradeYield,
       priority_yield_sample: sample
@@ -188,6 +215,8 @@ async function queueContactIntelligenceV2(limit=2){
 async function planCycle(body: any) {
   const { data: settings } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).single();
   if (!settings?.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
+  const brainEnabled=Boolean(settings?.strategy_brain_enabled);
+  const brainCanaryPct=Math.max(0,Math.min(50,Number(settings?.strategy_brain_canary_pct??15)));
   const requestedCap=Math.max(1,Math.min(6,Number(body.limit||3)));
   const [{count:dueWork},{count:runningWork},{count:resolveBacklog},{data:osmPressureSource}]=await Promise.all([
     db.schema("booked_solid").from("work_queue")
@@ -244,7 +273,7 @@ async function planCycle(body: any) {
   const recommended=Number(pc?.recommended_limit);
   const adaptiveLimit=Number.isFinite(recommended)&&recommended>0?recommended:(dueNow>30?1:dueNow>15?2:requestedCap);
   const requestedLimit=Math.max(1,Math.min(requestedCap,adaptiveLimit));
-  const ranked = await chooseStrategies(100);
+  const ranked = await chooseStrategies(100,brainEnabled,brainCanaryPct);
   const { data: marketRows } = await db.schema("booked_solid").from("market_catalog").select("*").in("lifecycle_state",["testing","active"]);
   const { data: activeDiscover } = await db.schema("booked_solid").from("work_queue").select("payload,status").eq("kind","discover").in("status",["pending","running"]);
   const { data: recentDiscover } = await db.schema("booked_solid").from("work_queue")
@@ -280,8 +309,9 @@ async function planCycle(body: any) {
   const maxExplore=requestedLimit;
   const exploreN=Math.max(0,Math.min(maxExplore,targetExplore-recentExplore));
   const exploitN=Math.max(0,requestedLimit-exploreN);
+  const exploitPool=selectionPool.filter((x:any)=>!x.brain_canary||x.brain_decision==="exploit");
   const exploit = exploitN>0
-    ? selectionPool.slice(0,exploitN).map((x:any)=>({...x,priority_selection_mode:"exploit"}))
+    ? exploitPool.slice(0,exploitN).map((x:any)=>({...x,priority_selection_mode:"exploit"}))
     : [];
   const exploitIds = new Set(exploit.map((x:any)=>x.id));
   const exploration = selectionPool
@@ -290,14 +320,17 @@ async function planCycle(body: any) {
       const rank=(x:any)=>{
         const age=x.last_used_at?Math.min(36,(Date.now()-new Date(x.last_used_at).getTime())/3600000):36;
         const lowSample=Math.max(0,8-Number(x.priority_yield_sample||0))*3;
-        return Number(x.exploration_weight||1)*18 + age + lowSample;
+        const brainDecision=String(x.brain_decision||"test");
+        const negativePenalty=brainDecision==="deprioritize"?70:0;
+        const canaryBoost=x.brain_canary&&brainDecision==="test"?10:0;
+        return Number(x.exploration_weight||1)*18 + age + lowSample + canaryBoost - negativePenalty;
       };
       return rank(b)-rank(a);
     })
     .slice(0,exploreN)
     .map((x:any)=>({...x,priority_selection_mode:"explore"}));
   const selected=[...exploit,...exploration].slice(0,requestedLimit);
-  const strategies = selected.map((s:any)=>({...s,target_location:marketFor(s,marketRows??[])}));
+  const strategies = selected.map((s:any)=>({...s,target_location:marketFor(s,marketRows??[],brainEnabled,brainCanaryPct)}));
   const { data: allEnabledSources } = await db.schema("booked_solid").from("source_catalog").select("*").eq("enabled",true);
   const coolingSources=(allEnabledSources??[]).filter((x:any)=>sourceCooling(x));
   const degradedSources=(allEnabledSources??[]).filter((x:any)=>!sourceCooling(x)&&(Number(x.consecutive_errors||0)>=4||String(x.metadata?.state||"")==="degraded"));
@@ -317,14 +350,25 @@ async function planCycle(body: any) {
   const denverPermitSource=sourceBySlug.get("denver_commercial_permits");
   const citySources=[chicagoPermitSource,nycPermitSource,austinPermitSource,seattlePermitSource,bostonPermitSource,sfPermitSource,philadelphiaPermitSource,philadelphiaTradeLicenseSource,denverPermitSource].filter(Boolean);
   const sourceLeadYield=(x:any)=>Number(x?.metadata?.lead_yield?.score??0);
-  const sourceDiscoveryTier=(x:any)=>String(x?.metadata?.discovery_tier??x?.metadata?.lead_yield?.tier??"testing");
+  const sourceDiscoveryTier=(x:any)=>{
+    const brainLane=String(x?.metadata?.brain_v2?.lane??"");
+    if(brainLane==="proven")return "proven";
+    if(brainLane==="testing")return "testing";
+    if(brainLane==="exploration")return "exploration_only";
+    if(brainLane==="blocked")return "blocked";
+    return String(x?.metadata?.discovery_tier??x?.metadata?.lead_yield?.tier??"testing");
+  };
   const sourceRankValue=(x:any)=>{
     const life=x?.lifecycle_state==="active"?35:15;
-    const quality=Number(x?.quality_score||50)*0.35;
-    const leadYield=sourceLeadYield(x)*1.10;
-    const priorityYield=Number(x?.metadata?.priority_yield_score||0)*0.15;
-    const exploration=Number(x?.exploration_weight||1)*3;
-    return life+quality+leadYield+priorityYield+exploration;
+    const quality=Number(x?.quality_score||50)*0.25;
+    const leadYield=sourceLeadYield(x)*0.75;
+    const priorityYield=Number(x?.metadata?.priority_yield_score||0)*0.10;
+    const exploration=Number(x?.exploration_weight||1)*2;
+    const brain=Number(x?.metadata?.brain_v2?.score??0);
+    const brainLane=String(x?.metadata?.brain_v2?.lane??"");
+    const zeroGuard=Boolean(x?.metadata?.brain_v2?.zero_yield_guard);
+    const laneBoost=brainLane==="proven"?18:brainLane==="testing"?5:brainLane==="exploration"?-8:brainLane==="blocked"?-100:0;
+    return life+quality+leadYield+priorityYield+exploration+brain*0.55+laneBoost-(zeroGuard?25:0);
   };
   const autoActiveSources=(sources??[])
     .filter((x:any)=>["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||""))&&["active","canary"].includes(String(x.lifecycle_state||"")))
@@ -376,59 +420,48 @@ async function planCycle(body: any) {
   const chooseBaseSource=(s:any)=>{
     const trade=String(s.trade||"Mixed"),market=String(s.target_location||"US");
     const useCount=Number(s.uses_count||0);
+    const unique=new Map<string,any>();
+    for(const x of [osmSource,nrcaSource,usaSpendingSource,...citySources,...autoActiveSources].filter(Boolean)){
+      if(discoveryCapable(x,trade,market))unique.set(String(x.slug),x);
+    }
+    const arr=[...unique.values()];
+    if(!arr.length)return null;
 
-    // Source allocation v3:
-    // 70% proven lead-yield sources, 20% testing/recovery lane, 10% exploration-only.
-    // If a requested lane has no compatible source, fail over to the best non-exploration source.
-    const pick=(arr:any[],salt:string)=>{
-      if(!arr.length)return null;
-      const ranked=[...arr].sort((a:any,b:any)=>sourceRankValue(b)-sourceRankValue(a));
-      const proven=ranked.filter((x:any)=>sourceDiscoveryTier(x)==="proven");
-      const testing=ranked.filter((x:any)=>{
-        if(sourceDiscoveryTier(x)!=="testing")return false;
-        const sample=Number(x?.metadata?.lead_yield?.sample??0);
-        const leads=Number(x?.metadata?.lead_yield?.leads??0);
-        const score=Number(x?.metadata?.lead_yield?.score??0);
-        return sample<5||leads>0||score>=20;
-      });
-      const exploration=ranked.filter((x:any)=>{
-        const tier=sourceDiscoveryTier(x);
-        if(tier==="exploration_only")return true;
-        if(tier!=="testing")return false;
-        const sample=Number(x?.metadata?.lead_yield?.sample??0);
-        const leads=Number(x?.metadata?.lead_yield?.leads??0);
-        const score=Number(x?.metadata?.lead_yield?.score??0);
-        return !(sample<5||leads>0||score>=20);
-      });
-      const bucket=hashText(String(s.slug)+":"+salt+":"+useCount)%100;
-      let pool:any[]=[];
-      let lane="proven";
-      if(bucket<70){
-        pool=proven.length?proven:(testing.length?testing:ranked.filter((x:any)=>sourceDiscoveryTier(x)!=="exploration_only"));
-      }else if(bucket<90){
-        lane="testing";
-        pool=testing.length?testing:(proven.length?proven:ranked.filter((x:any)=>sourceDiscoveryTier(x)!=="exploration_only"));
-      }else{
-        lane="exploration";
-        pool=exploration.length?exploration:(testing.length?testing:(proven.length?proven:ranked));
-      }
-      if(!pool.length)pool=ranked;
-      const top=lane==="exploration"?pool:pool.slice(0,Math.max(1,Math.ceil(pool.length*0.5)));
-      return top[hashText(String(s.slug)+":"+salt+":"+lane+":"+useCount)%top.length];
-    };
-    if(discoveryCapable(osmSource,trade,market))return osmSource;
-    const cities=citySources.filter((x:any)=>discoveryCapable(x,trade,market));
-    if(cities.length)return pick(cities,"city");
-    const generics=autoActiveSources.filter((x:any)=>discoveryCapable(x,trade,market));
-    if(generics.length)return pick(generics,"generic");
-    if(discoveryCapable(usaSpendingSource,trade,market))return usaSpendingSource;
-    if(discoveryCapable(nrcaSource,trade,market))return nrcaSource;
+    const ranked=[...arr]
+      .filter((x:any)=>sourceDiscoveryTier(x)!=="blocked")
+      .sort((a:any,b:any)=>sourceRankValue(b)-sourceRankValue(a));
+    if(!ranked.length)return null;
 
-    const fallbackGenerics=autoActiveSources.filter((x:any)=>Boolean(x?.metadata?.market_hint||x?.metadata?.market));
-    if(fallbackGenerics.length)return pick(fallbackGenerics,"fallback");
-    const fallbackCities=citySources.filter((x:any)=>Boolean(x?.metadata?.market_hint||x?.metadata?.market));
-    if(fallbackCities.length)return pick(fallbackCities,"fallback-city");
-    return pick(autoActiveSources,"canary");
+    const proven=ranked.filter((x:any)=>sourceDiscoveryTier(x)==="proven");
+    const testing=ranked.filter((x:any)=>{
+      if(sourceDiscoveryTier(x)!=="testing")return false;
+      const sample=Number(x?.metadata?.brain_v2?.sample??x?.metadata?.lead_yield?.sample??0);
+      const leads=Number(x?.metadata?.brain_v2?.leads??x?.metadata?.lead_yield?.leads??0);
+      return sample<20||leads>0;
+    });
+    const exploration=ranked.filter((x:any)=>sourceDiscoveryTier(x)==="exploration_only");
+    const strategyMode=String(s.priority_selection_mode||"exploit");
+    const bucket=hashText(String(s.slug)+":brain-source:"+useCount)%100;
+    let pool:any[]=[];
+    let lane="proven";
+
+    if(strategyMode==="exploit"){
+      // Never spend exploit capacity on an exploration-only source.
+      if(proven.length){ lane="proven"; pool=proven; }
+      else if(testing.length){ lane="testing"; pool=testing; }
+      else return null;
+    }else{
+      // Exploration jobs are the only place where mature zero-yield/new sources may be tested.
+      if(bucket<35 && proven.length){ lane="proven"; pool=proven; }
+      else if(bucket<65 && testing.length){ lane="testing"; pool=testing; }
+      else if(exploration.length){ lane="exploration"; pool=exploration; }
+      else if(testing.length){ lane="testing"; pool=testing; }
+      else { lane="proven"; pool=proven; }
+    }
+
+    if(!pool.length)return null;
+    const top=lane==="exploration"?pool:pool.slice(0,Math.max(1,Math.ceil(pool.length*0.40)));
+    return top[hashText(String(s.slug)+":"+market+":"+lane+":"+useCount)%top.length];
   };
   if (!strategies.length) {
     return json({ ok: true, paused: true, reason: "no_strategy_available" }, 200);
@@ -439,13 +472,6 @@ async function planCycle(body: any) {
     const trade=String(s.trade||"Mixed"),market=String(s.target_location||"US");
     let source:any=chooseBaseSource(s);
     if(!source)return null;
-
-    const compatibleGeneric=autoActiveSources.filter((x:any)=>discoveryCapable(x,trade,market));
-    const cityForMarket=citySources.find((x:any)=>discoveryCapable(x,trade,market));
-    if(compatibleGeneric.length && useCount%10===8) source=compatibleGeneric[(hashText(String(s.slug)+":"+useCount))%compatibleGeneric.length];
-    else if(cityForMarket && useCount%4===2) source=cityForMarket;
-    else if(["Roofing","Commercial Roofing"].includes(trade) && discoveryCapable(nrcaSource,trade,market) && useCount%8===7) source=nrcaSource;
-    else if(trade==="Mixed" && discoveryCapable(usaSpendingSource,trade,market) && useCount%6===5) source=usaSpendingSource;
 
     if(!discoveryCapable(source,trade,market))return null;
     const jobMarket=String(source?.metadata?.market_hint||source?.metadata?.market||market);
@@ -469,6 +495,12 @@ async function planCycle(body: any) {
         strategy_priority_yield_score:Number(s.priority_yield_score||25),
         trade_priority_yield_score:Number(s.trade_priority_yield_score||25),
         source_priority_yield_score:Number(source?.metadata?.priority_yield_score||25),
+        brain_policy_version:brainEnabled?2:0,
+        brain_canary_pct:brainCanaryPct,
+        brain_strategy_score:Number(s.brain_score??0),
+        brain_strategy_decision:String(s.brain_decision??"legacy"),
+        brain_source_score:Number(source?.metadata?.brain_v2?.score??0),
+        brain_source_lane:String(source?.metadata?.brain_v2?.lane??sourceDiscoveryTier(source)),
         evolution_source:Boolean(source?.metadata?.discovered_by==="self_evolution")
       },
       status:"pending",
@@ -531,6 +563,13 @@ async function planCycle(body: any) {
       selected_source: queued?.[0]?.payload?.source_slug??null,
       cooling_sources: coolingSources.slice(0,8).map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
     },
+    strategy_brain:{
+      enabled:brainEnabled,
+      policy_version:2,
+      canary_pct:brainCanaryPct,
+      rollout:"blended_canary",
+      source_zero_yield_guard:true
+    },
     diversity: {
       recent_window_cycles: 8,
       max_attempts_per_trade: 3,
@@ -545,6 +584,10 @@ async function planCycle(body: any) {
       query_template: s.query_template,
       offer_hint: s.offer_hint,
       planner_score: s.planner_score,
+      legacy_planner_score:s.legacy_planner_score,
+      brain_planner_score:s.brain_planner_score,
+      brain_score:s.brain_score,
+      brain_decision:s.brain_decision,
       priority_selection_mode: s.priority_selection_mode||"exploit",
       priority_yield_score: s.priority_yield_score,
       trade_priority_yield_score: s.trade_priority_yield_score,
