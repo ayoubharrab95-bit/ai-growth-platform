@@ -233,3 +233,22 @@ The strongest behavior so far comes from productive Champion sources, persistent
 ### Definition of a real stall
 
 Treat the system as genuinely stalled only when valid Leads/new companies materially stop across sustained rolling windows **or** queues stop draining/responding. A momentary pause with healthy completion flow is normal operating behavior.
+
+## Stability Audit v5
+
+Current known-good runtime after the latest production audit:
+
+- Orchestrator **v61**
+- Worker **v116**
+- Qualifier **v20**
+- Sheet Sync **v23**
+- Revenue CRM Writer **v1**
+
+Verified audit fixes:
+
+1. The pg_net watchdog used the invalid severity literal `WARNING` while `health_events` accepts only `INFO/WARN/ERROR`. It now records auto-restart events as `WARN`.
+2. Orchestrator race-prone single-row mutations now use `maybeSingle()` with safe zero-row fallbacks. This removes avoidable `PGRST116` failures during concurrent queue activity without changing lead-generation logic.
+
+Production integrity at audit time was clean: no active duplicate jobs/domains, no orphan Leads/Contacts/Evidence, no Qualified rows below threshold, no HOT-rule violations, no suppressed selected contacts, no contact-name noise, no non-ALLOWED exploit routing, and no OSM production jobs.
+
+**Do not tune scoring, source-rights rules, or lane capacity based on this audit.** The system was actively producing Leads and Qualified prospects. Preserve v61/v116 unless rolling live evidence proves a specific regression.
