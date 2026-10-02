@@ -305,6 +305,7 @@ async function searchOSM(trade:string,location:string,latArg?:number,lonArg?:num
   const {data:cached}=await db.schema("booked_solid").from("source_query_cache")
     .select("payload,expires_at").eq("cache_key",cacheKey).gt("expires_at",new Date().toISOString()).maybeSingle();
   if(cached?.payload&&Array.isArray(cached.payload.results)){
+   try{await db.schema("booked_solid").rpc("record_source_query_cache_hit",{p_cache_key:cacheKey});}catch{}
    return {provider:"openstreetmap_overpass",results:cached.payload.results,cached:true,cache_key:cacheKey};
   }
  }catch{}
@@ -901,6 +902,7 @@ async function resolveCompany(job:any){
   resolutionMethod="resolution_cache:"+String(cachedResolution.method||"verified");
   resolutionConfidence=Number(cachedResolution.confidence||80);
   preflight={cached:true,cache_key:resolutionCacheKey};
+  try{await db.schema("booked_solid").rpc("record_resolution_cache_hit",{p_cache_key:resolutionCacheKey});}catch{}
  }
  else if(directWebsite)hit={url:directWebsite,title:c.name};
  else{
