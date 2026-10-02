@@ -49,6 +49,27 @@ function triggers(text:string){
  ];
  return rules.filter((x:any)=>x[2].test(text)).map((x:any)=>({type:x[0],strength:x[1],claim:x[3]}));
 }
+function digitalSignals(flags:any,pages:number){
+ const out:any[]=[];
+ // These are detection statements, not broad SEO judgments.
+ if(pages>0 && !flags.metaDescription && !flags.structuredData){
+  out.push({
+   type:"seo_foundation_gap",
+   claim:"On the sampled public site, the homepage did not expose a meta description or structured-data markup in the fetched HTML.",
+   confidence:72,
+   metadata:{digital:true,measured:true,check:"homepage_meta_description_or_structured_data"}
+  });
+ }
+ if(pages>=2 && !flags.form && !flags.quoteCta && !flags.contactCta){
+  out.push({
+   type:"website_conversion_gap",
+   claim:"Across the sampled public pages, no clear quote/contact CTA or HTML form was detected in the fetched content.",
+   confidence:74,
+   metadata:{digital:true,measured:true,check:"cta_or_form"}
+  });
+ }
+ return out;
+}
 Deno.serve(async req=>{
  try{
   if(req.method==="OPTIONS")return new Response("ok",{headers:H});
@@ -62,18 +83,26 @@ Deno.serve(async req=>{
   const root=new URL(raw);if(root.protocol!=="https:")return out({ok:false,error:"https_required"},400);
   const urls=[root.toString(),...paths.map(p=>new URL(p,root).toString())];
   let combined="";let foundEmails=new Set<string>();let foundPhones=new Map<string,any>();let pages=0;const seen=new Set<string>();
+  const siteFlags={metaDescription:false,structuredData:false,form:false,quoteCta:false,contactCta:false};
   for(const url of urls){
    if(seen.has(url))continue;seen.add(url);
    try{
     const r=await fetch(url,{redirect:"follow",headers:{"User-Agent":"BookedSolidResearchBot/1.0 (+https://www.bookedsolidcopy.com/)"}});
     if(!r.ok)continue;const html=await r.text();pages++;
     const visible=clean(html);combined+=" "+visible;
+    if(pages===1){
+      siteFlags.metaDescription=/<meta[^>]+name=["']description["'][^>]+content=["'][^"']{20,}["']/i.test(html)||/<meta[^>]+content=["'][^"']{20,}["'][^>]+name=["']description["']/i.test(html);
+      siteFlags.structuredData=/application\/ld\+json/i.test(html)&&/(LocalBusiness|Organization|Contractor|HomeAndConstructionBusiness)/i.test(html);
+    }
+    siteFlags.form=siteFlags.form||/<form\b/i.test(html);
+    siteFlags.quoteCta=siteFlags.quoteCta||/\b(?:request|get|schedule|book|start)\s+(?:a\s+)?(?:free\s+)?(?:estimate|quote|consultation)\b/i.test(visible);
+    siteFlags.contactCta=siteFlags.contactCta||/\b(?:contact us|call us|schedule service|book service)\b/i.test(visible);
     for(const e of html.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)??[])foundEmails.add(e.toLowerCase());
     for(const ph of phones(visible,url)){if(!foundPhones.has(ph.phone))foundPhones.set(ph.phone,ph);}
     for(const u of links(html,root.toString()).slice(0,10))if(!seen.has(u))urls.push(u);
    }catch{}
   }
-  const types=evidence(combined);const triggerRows=triggers(combined);const identityTrade=company?tradeFromIdentity(company.name,company.canonical_domain,company.trade):null;
+  const types=evidence(combined);const triggerRows=triggers(combined);const digitalRows=digitalSignals(siteFlags,pages);const identityTrade=company?tradeFromIdentity(company.name,company.canonical_domain,company.trade):null;
   if(company){
    await db.schema("booked_solid").from("companies").update({status:"researching",last_researched_at:new Date().toISOString()}).eq("id",company.id);
    for(const type of types){
@@ -83,12 +112,18 @@ Deno.serve(async req=>{
     else await db.schema("booked_solid").from("evidence").insert({company_id:company.id,evidence_type:type,claim,snippet:combined.slice(0,1200),source_url:root.toString(),confidence:70,metadata:{pages_researched:pages}});
    }
    for(const tr of triggerRows){const {data:x}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",company.id).eq("evidence_type",tr.type).eq("source_url",root.toString()).limit(1);if((x??[]).length)await db.schema("booked_solid").from("evidence").update({claim:tr.claim,snippet:combined.slice(0,1200),confidence:80,observed_at:new Date().toISOString(),metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}}).eq("id",x![0].id);else await db.schema("booked_solid").from("evidence").insert({company_id:company.id,evidence_type:tr.type,claim:tr.claim,snippet:combined.slice(0,1200),source_url:root.toString(),confidence:80,metadata:{trigger:true,trigger_strength:tr.strength,pages_researched:pages}});}
+   for(const dg of digitalRows){
+    const {data:x}=await db.schema("booked_solid").from("evidence").select("id").eq("company_id",company.id).eq("evidence_type",dg.type).eq("source_url",root.toString()).limit(1);
+    const payload={claim:dg.claim,snippet:"Measured from fetched public HTML; no visual or performance inference.",confidence:dg.confidence,observed_at:new Date().toISOString(),metadata:{...dg.metadata,pages_researched:pages}};
+    if((x??[]).length)await db.schema("booked_solid").from("evidence").update(payload).eq("id",x![0].id);
+    else await db.schema("booked_solid").from("evidence").insert({company_id:company.id,evidence_type:dg.type,source_url:root.toString(),...payload});
+   }
    for(const email of foundEmails)await db.schema("booked_solid").from("contacts").upsert({
     company_id:company.id,email,email_confidence:60,source_url:root.toString(),status:"unverified"
    },{onConflict:"company_id,email"});
    for(const ph of foundPhones.values()){const {data:x}=await db.schema("booked_solid").from("contacts").select("id").eq("company_id",company.id).eq("phone",ph.phone).limit(1);if((x??[]).length)await db.schema("booked_solid").from("contacts").update({phone_type:"company_public",phone_confidence:72,phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",x![0].id);else await db.schema("booked_solid").from("contacts").insert({company_id:company.id,phone:ph.phone,phone_type:"company_public",phone_confidence:72,phone_source_url:ph.phone_source_url,phone_status:"unverified",sms_consent_status:"unknown",sms_eligible:false,phone_last_verified_at:new Date().toISOString(),status:"unverified"});}
    await db.schema("booked_solid").from("companies").update({status:company.status==="qualified"?"qualified":"discovered",last_researched_at:new Date().toISOString(),last_enriched_at:new Date().toISOString(),enrichment_version:1,...(identityTrade?{trade:identityTrade}:{}),metadata:{...(company.metadata??{}),phones_found:foundPhones.size,trigger_types:triggerRows.map((x:any)=>x.type)}}).eq("id",company.id);
   }
-  return out({ok:true,url:root.toString(),pages_researched:pages,signals:types,triggers:triggerRows.map((x:any)=>({type:x.type,strength:x.strength})),emails_found:[...foundEmails].length,phones_found:foundPhones.size});
+  return out({ok:true,url:root.toString(),pages_researched:pages,signals:types,triggers:triggerRows.map((x:any)=>({type:x.type,strength:x.strength})),digital_signals:digitalRows.map((x:any)=>x.type),emails_found:[...foundEmails].length,phones_found:foundPhones.size});
  }catch(e){console.error(e);return out({ok:false,error:String(e)},500)}
 });
