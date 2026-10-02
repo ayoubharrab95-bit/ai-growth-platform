@@ -49,9 +49,26 @@ function serviceAccount(){
   if(!sa.client_email||!sa.private_key)throw new Error("invalid_service_account_json");
   return sa;
 }
+async function googleReadFetch(url:string,token:string,label:string){
+  let lastStatus=0,lastText="";
+  for(let attempt=0;attempt<4;attempt++){
+    const r=await fetch(url,{headers:{Authorization:"Bearer "+token}});
+    lastStatus=r.status;
+    if(r.ok)return r;
+    lastText=await r.text();
+    if(![429,500,502,503,504].includes(r.status))break;
+    const retryAfter=Number(r.headers.get("retry-after")||0);
+    const waitMs=retryAfter>0?retryAfter*1000:[1200,2500,5000,8500][attempt];
+    await new Promise(resolve=>setTimeout(resolve,waitMs));
+  }
+  throw new Error(label+"_"+lastStatus+":"+lastText);
+}
 async function sheetMetadata(id:string,token:string){
-  const r=await fetch("https://sheets.googleapis.com/v4/spreadsheets/"+id+"?fields=spreadsheetId,properties.title,sheets.properties(sheetId,title,gridProperties)",{headers:{Authorization:"Bearer "+token}});
-  if(!r.ok)throw new Error("sheet_metadata_"+r.status+":"+await r.text());
+  const r=await googleReadFetch(
+    "https://sheets.googleapis.com/v4/spreadsheets/"+id+"?fields=spreadsheetId,properties.title,sheets.properties(sheetId,title,gridProperties)",
+    token,
+    "sheet_metadata"
+  );
   return await r.json();
 }
 function sheetIdMap(meta:any){
@@ -92,9 +109,24 @@ async function batchUpdate(id:string,requests:any[],token:string){
   return await r.json();
 }
 async function readValues(id:string,range:string,token:string){
-  const r=await fetch("https://sheets.googleapis.com/v4/spreadsheets/"+id+"/values/"+encodeURIComponent(range)+"?majorDimension=ROWS",{headers:{Authorization:"Bearer "+token}});
-  if(!r.ok)throw new Error("sheet_read_"+r.status+":"+await r.text());
+  const r=await googleReadFetch(
+    "https://sheets.googleapis.com/v4/spreadsheets/"+id+"/values/"+encodeURIComponent(range)+"?majorDimension=ROWS",
+    token,
+    "sheet_read"
+  );
   return await r.json();
+}
+async function batchReadValues(id:string,ranges:string[],token:string){
+  const qs=ranges.map(r=>"ranges="+encodeURIComponent(r)).join("&");
+  const r=await googleReadFetch(
+    "https://sheets.googleapis.com/v4/spreadsheets/"+id+"/values:batchGet?majorDimension=ROWS&"+qs,
+    token,
+    "sheet_batch_read"
+  );
+  const j=await r.json();
+  const out:any={};
+  for(let i=0;i<ranges.length;i++)out[ranges[i]]=j.valueRanges?.[i]||{values:[]};
+  return out;
 }
 async function ensureTabCapacity(id:string,sm:any,name:string,requiredRows:number,requiredCols:number,token:string){
   if(sm[name]===undefined)throw new Error("missing_tab:"+name);
@@ -240,32 +272,43 @@ async function writeMaster(payload:any,token:string){
     if(sm[name]===undefined)throw new Error("MASTER:missing_tab:"+name);
     await writeAnyTab(id,sm,name,data as any[][],token,1000,26);
   }
-  const cmdCheck=await readValues(id,"COMMAND CENTER!A1:B14",token);
+  const ranges=[
+    "COMMAND CENTER!A1:B14","PRODUCTS!A1:A","AGENTS!A1:A","RIGHTS REVIEW!A1:A",
+    "FIELD SAFETY!A1:A","BUYERS!A1:A","RUNS!A1:A","AUDIT!A1:A","SYSTEM!A1:B9"
+  ];
+  const v=await batchReadValues(id,ranges,token);
+  const cmdCheck=v[ranges[0]];
   if(String(cmdCheck.values?.[0]?.[0]||"")!=="Metric")throw new Error("MASTER:verify_header:COMMAND CENTER");
   if(String(cmdCheck.values?.[1]?.[0]||"")!=="Cycle ID")throw new Error("MASTER:verify_cycle_row");
 
+  const specs:any[]=[
+    ["PRODUCTS","Slug",products.length,ranges[1]],
+    ["AGENTS","Slug",agents.length,ranges[2]],
+    ["RIGHTS REVIEW","Source",rights.length,ranges[3]],
+    ["FIELD SAFETY","Field Key",fields.length,ranges[4]],
+    ["BUYERS","Company",buyers.length,ranges[5]],
+    ["RUNS","Agent",Math.min(500,runs.length),ranges[6]],
+    ["AUDIT","Event At",Math.min(500,audit.length),ranges[7]]
+  ];
   const masterVerify:any[]=[];
-  masterVerify.push(await verifyHeaderAndCount(id,"PRODUCTS","Slug",products.length,token));
-  masterVerify.push(await verifyHeaderAndCount(id,"AGENTS","Slug",agents.length,token));
-  masterVerify.push(await verifyHeaderAndCount(id,"RIGHTS REVIEW","Source",rights.length,token));
-  masterVerify.push(await verifyHeaderAndCount(id,"FIELD SAFETY","Field Key",fields.length,token));
-  masterVerify.push(await verifyHeaderAndCount(id,"BUYERS","Company",buyers.length,token));
-  masterVerify.push(await verifyHeaderAndCount(id,"RUNS","Agent",Math.min(500,runs.length),token));
-  masterVerify.push(await verifyHeaderAndCount(id,"AUDIT","Event At",Math.min(500,audit.length),token));
+  for(const [tab,header,expected,range] of specs){
+    const vals=v[range]?.values||[];
+    const actual=Math.max(0,vals.length-1);
+    if(String(vals?.[0]?.[0]||"")!==header)throw new Error("MASTER:verify_header:"+tab);
+    if(actual!==expected)throw new Error("MASTER:verify_rows:"+tab+":"+actual+" expected "+expected);
+    masterVerify.push({tab,header,actualRows:actual});
+  }
 
-  const sysCheck=await readValues(id,"SYSTEM!A1:B9",token);
+  const sysCheck=v[ranges[8]];
   if(String(sysCheck.values?.[0]?.[0]||"")!=="Setting"||String(sysCheck.values?.[0]?.[1]||"")!=="Value")throw new Error("MASTER:verify_system_header");
 
-  return {id,title:meta.properties?.title,verified_tabs:9,verification:masterVerify};
+  return {id,title:meta.properties?.title,verified_tabs:9,read_requests:1,verification:masterVerify};
 }
 async function verifyProductSheet(targetKey:string,expectedSafe:number,expectedReview:number,token:string){
   const id=TARGETS[targetKey].id;
-  const safe=await readValues(id,"SAFE DATA!A1:R",token);
-  const review=await readValues(id,"REVIEW QUEUE!A1:L",token);
-  const overview=await readValues(id,"OVERVIEW!A1:B20",token);
-  const signals=await readValues(id,"SIGNALS!A1:H",token);
-  const dict=await readValues(id,"DATA DICTIONARY!A1:F",token);
-  const version=await readValues(id,"VERSION LOG!A1:H",token);
+  const ranges=["SAFE DATA!A1:R","REVIEW QUEUE!A1:L","OVERVIEW!A1:B20","SIGNALS!A1:H","DATA DICTIONARY!A1:F","VERSION LOG!A1:H"];
+  const v=await batchReadValues(id,ranges,token);
+  const safe=v[ranges[0]],review=v[ranges[1]],overview=v[ranges[2]],signals=v[ranges[3]],dict=v[ranges[4]],version=v[ranges[5]];
 
   const actualSafe=Math.max(0,(safe.values||[]).length-1);
   const actualReview=Math.max(0,(review.values||[]).length-1);
@@ -276,7 +319,7 @@ async function verifyProductSheet(targetKey:string,expectedSafe:number,expectedR
   if(String(dict.values?.[0]?.[0]||"")!=="Field Key")throw new Error(targetKey+":verify_dictionary_header");
   if(String(version.values?.[0]?.[0]||"")!=="Version")throw new Error(targetKey+":verify_version_header");
   if(actualSafe!==expectedSafe||actualReview!==expectedReview)throw new Error(targetKey+":verify_counts:"+actualSafe+"/"+actualReview+" expected "+expectedSafe+"/"+expectedReview);
-  return {actualSafe,actualReview,verified_tabs:6};
+  return {actualSafe,actualReview,verified_tabs:6,read_requests:1};
 }
 async function commercialSync(token:string){
   const {data:payload,error:prepErr}=await db.rpc("solidos_prepare_commercial_sheet_sync");
@@ -418,15 +461,14 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   // Preserve Courtney's manual workflow columns by stable Lead ID.
   // Fail safely if the ACTION QUEUE column schema was manually changed.
   const expectedAQHeader=["Company","Priority","Opportunity","Trade","Decision Maker / Contact","Role","Email","Phone","Why Now","Offer","Action","Review Status","Owner","Next Follow-up","Courtney Notes","Lead ID","Company ID"];
-  const aqHeaderRead=await readValues(id,"ACTION QUEUE!A1:Q1",token);
-  const aqHeader=(aqHeaderRead.values?.[0]||[]).map((x:any)=>String(x||""));
+  const aqAll=await readValues(id,"ACTION QUEUE!A1:Q",token);
+  const aqHeader=(aqAll.values?.[0]||[]).map((x:any)=>String(x||""));
   if(expectedAQHeader.some((x:string,i:number)=>aqHeader[i]!==x)){
     throw new Error("CORE:action_queue_schema_changed");
   }
 
-  const oldAQ=await readValues(id,"ACTION QUEUE!A2:Q",token);
   const manual=new Map<string,any[]>();
-  for(const r of oldAQ.values||[]){
+  for(const r of (aqAll.values||[]).slice(1)){
     const leadId=r?.[15];
     if(leadId)manual.set(String(leadId),[r?.[11]||"Not Reviewed",r?.[12]||"",r?.[13]||"",r?.[14]||""]);
   }
@@ -626,18 +668,21 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
     ["Qualified route coverage",(ready.length+contactForms.length+phoneOnly.length)===qualified.length?"PASS":"WARN",qualified.length-(ready.length+contactForms.length+phoneOnly.length),"Every qualified lead should have a usable route or explicit gap."]
   ];
 
-  const oldLog=await readValues(id,"HOURLY LOG!A1:X1000",token);
-  let logRows=oldLog.values||[];
-  if(!logRows.length)logRows=[["Timestamp","Companies","Δ Companies","Leads","Δ Leads","Qualified","Δ Qualified","Candidates","Ready Leads","Ready Messages","Contacts","Δ Contacts","Email Contacts","Phone Contacts","Evidence","Δ Evidence","Due Work","Blocked Work","Note","Named Decision Makers","Contact Intelligence v2 Qualified Coverage","Contact Form Routes","Phone Routes"]];
-  const last=logRows.length>1?logRows[logRows.length-1]:null;
-  const lastTs=last?.[0]?Date.parse(String(last[0])):0;
-  if(!lastTs||Date.now()-lastTs>=55*60*1000){
-    const prev=last||[];
-    logRows.push([nowIso,companies.length,prev[1]!==undefined?companies.length-Number(prev[1]||0):"",leads.length,prev[3]!==undefined?leads.length-Number(prev[3]||0):"",
-      qualified.length,prev[5]!==undefined?qualified.length-Number(prev[5]||0):"",candidates.length,ready.length,readyMessages,contacts.length,
-      prev[10]!==undefined?contacts.length-Number(prev[10]||0):"",emailContacts,phoneContacts,evidence.length,
-      prev[14]!==undefined?evidence.length-Number(prev[14]||0):"",dueNow,blockedWork,
-      "SolidOS live sync; full CRM tabs refreshed; email/SMS/buyer outreach OFF.",namedDM,qualified.length,contactForms.length,phoneOnly.length]);
+  let logRows:any[][]=[];
+  if(fullMode){
+    const oldLog=await readValues(id,"HOURLY LOG!A1:X1000",token);
+    logRows=oldLog.values||[];
+    if(!logRows.length)logRows=[["Timestamp","Companies","Δ Companies","Leads","Δ Leads","Qualified","Δ Qualified","Candidates","Ready Leads","Ready Messages","Contacts","Δ Contacts","Email Contacts","Phone Contacts","Evidence","Δ Evidence","Due Work","Blocked Work","Note","Named Decision Makers","Contact Intelligence v2 Qualified Coverage","Contact Form Routes","Phone Routes"]];
+    const last=logRows.length>1?logRows[logRows.length-1]:null;
+    const lastTs=last?.[0]?Date.parse(String(last[0])):0;
+    if(!lastTs||Date.now()-lastTs>=55*60*1000){
+      const prev=last||[];
+      logRows.push([nowIso,companies.length,prev[1]!==undefined?companies.length-Number(prev[1]||0):"",leads.length,prev[3]!==undefined?leads.length-Number(prev[3]||0):"",
+        qualified.length,prev[5]!==undefined?qualified.length-Number(prev[5]||0):"",candidates.length,ready.length,readyMessages,contacts.length,
+        prev[10]!==undefined?contacts.length-Number(prev[10]||0):"",emailContacts,phoneContacts,evidence.length,
+        prev[14]!==undefined?evidence.length-Number(prev[14]||0):"",dueNow,blockedWork,
+        "SolidOS live sync; full CRM tabs refreshed; email/SMS/buyer outreach OFF.",namedDM,qualified.length,contactForms.length,phoneOnly.length]);
+    }
   }
 
   const promotedCount=priorityEnrichmentRows.filter((x:any)=>String(x.status)==="promoted").length;
@@ -713,7 +758,19 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   await writeIf("SYSTEM STATUS",sys,300,10);
   await writeIf("PRIORITY ENGINE",priorityEngine,1000,11);
 
-  const check=await readValues(id,"COMMAND CENTER!A1:H25",token);
+  const verifyRanges:string[]=["COMMAND CENTER!A1:H25"];
+  if(wants("ACTION QUEUE"))verifyRanges.push("ACTION QUEUE!A1:Q");
+  if(wants("QUALIFIED 360"))verifyRanges.push("QUALIFIED 360!A1:A");
+  if(wants("ALL LEADS"))verifyRanges.push("ALL LEADS!A1:A");
+  if(wants("COMPANIES"))verifyRanges.push("COMPANIES!A1:A");
+  if(wants("CONTACTS"))verifyRanges.push("CONTACTS!A1:A");
+  if(wants("MESSAGES"))verifyRanges.push("MESSAGES!A1:A");
+  if(wants("EVIDENCE"))verifyRanges.push("EVIDENCE!A1:A");
+  if(wants("TRADE SUMMARY"))verifyRanges.push("TRADE SUMMARY!A1:F1");
+  if(wants("PRIORITY ENGINE"))verifyRanges.push("PRIORITY ENGINE!A1:K4");
+
+  const vv=await batchReadValues(id,verifyRanges,token);
+  const check=vv["COMMAND CENTER!A1:H25"]||{values:[]};
   if(String(check.values?.[0]?.[0]||"")!=="BOOKED SOLID — COMMAND CENTER")throw new Error("CORE:verify_command_header");
   if(Number(check.values?.[2]?.[1]||-1)!==companies.length)throw new Error("CORE:verify_company_count");
   if(Number(check.values?.[2]?.[3]||-1)!==leads.length)throw new Error("CORE:verify_lead_count");
@@ -721,23 +778,32 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   if(Number(check.values?.[2]?.[7]||-1)!==candidates.length)throw new Error("CORE:verify_candidate_count");
 
   const verification:any[]=[];
-  if(wants("ACTION QUEUE"))verification.push(await verifyHeaderAndCount(id,"ACTION QUEUE","Company",qualified.length,token));
-  if(wants("QUALIFIED 360"))verification.push(await verifyHeaderAndCount(id,"QUALIFIED 360","Company",qualified.length,token));
-  if(wants("ALL LEADS"))verification.push(await verifyHeaderAndCount(id,"ALL LEADS","Company",leads.length,token));
-  if(wants("COMPANIES"))verification.push(await verifyHeaderAndCount(id,"COMPANIES","Company",companies.length,token));
-  if(wants("CONTACTS"))verification.push(await verifyHeaderAndCount(id,"CONTACTS","Company",contacts.length,token));
-  if(wants("MESSAGES"))verification.push(await verifyHeaderAndCount(id,"MESSAGES","Company",messages.length,token));
-  if(wants("EVIDENCE"))verification.push(await verifyHeaderAndCount(id,"EVIDENCE","Company",evidence.length,token));
+  const verifyCount=(range:string,tab:string,header:string,expected:number)=>{
+    const vals=vv[range]?.values||[];
+    const actualRows=Math.max(0,vals.length-1);
+    const actualHeader=String(vals?.[0]?.[0]||"");
+    if(actualHeader!==header)throw new Error("CORE:verify_header:"+tab+":"+actualHeader);
+    if(actualRows!==expected)throw new Error("CORE:verify_rows:"+tab+":"+actualRows+" expected "+expected);
+    verification.push({tab,header:actualHeader,actualRows});
+  };
+
+  if(wants("ACTION QUEUE"))verifyCount("ACTION QUEUE!A1:Q","ACTION QUEUE","Company",qualified.length);
+  if(wants("QUALIFIED 360"))verifyCount("QUALIFIED 360!A1:A","QUALIFIED 360","Company",qualified.length);
+  if(wants("ALL LEADS"))verifyCount("ALL LEADS!A1:A","ALL LEADS","Company",leads.length);
+  if(wants("COMPANIES"))verifyCount("COMPANIES!A1:A","COMPANIES","Company",companies.length);
+  if(wants("CONTACTS"))verifyCount("CONTACTS!A1:A","CONTACTS","Company",contacts.length);
+  if(wants("MESSAGES"))verifyCount("MESSAGES!A1:A","MESSAGES","Company",messages.length);
+  if(wants("EVIDENCE"))verifyCount("EVIDENCE!A1:A","EVIDENCE","Company",evidence.length);
 
   if(wants("TRADE SUMMARY")){
-    const tradeCheck=await readValues(id,"TRADE SUMMARY!A1:F1",token);
+    const tradeCheck=vv["TRADE SUMMARY!A1:F1"]||{values:[]};
     if(String(tradeCheck.values?.[0]?.[0]||"")!=="Trade"||String(tradeCheck.values?.[0]?.[1]||"")!=="Qualified")throw new Error("CORE:verify_trade_summary_header");
   }
 
   if(wants("ACTION QUEUE")){
-    const postAQ=await readValues(id,"ACTION QUEUE!A2:Q",token);
+    const postAQ=vv["ACTION QUEUE!A1:Q"]||{values:[]};
     const postManual=new Map<string,any[]>();
-    for(const r of postAQ.values||[]){
+    for(const r of (postAQ.values||[]).slice(1)){
       const leadId=r?.[15];
       if(leadId)postManual.set(String(leadId),[r?.[11]||"Not Reviewed",r?.[12]||"",r?.[13]||"",r?.[14]||""]);
     }
@@ -751,14 +817,14 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   }
 
   if(wants("PRIORITY ENGINE")){
-    const priorityCheck=await readValues(id,"PRIORITY ENGINE!A1:K4",token);
+    const priorityCheck=vv["PRIORITY ENGINE!A1:K4"]||{values:[]};
     if(String(priorityCheck.values?.[0]?.[0]||"")!=="PRIORITY YIELD ENGINE")throw new Error("CORE:verify_priority_engine_header");
   }
 
   return {ok:true,mode:fullMode?"full":"fast",changed:[...changed],written_tabs:writtenTabs,
     companies:companies.length,leads:leads.length,qualified:qualified.length,candidates:candidates.length,
     ready:ready.length,contact_forms:contactForms.length,phone_only:phoneOnly.length,contacts:contacts.length,evidence:evidence.length,
-    due_work:dueNow,running_work:runningWork,command_rows:(check.values||[]).length,verification};
+    due_work:dueNow,running_work:runningWork,command_rows:(check.values||[]).length,verification_read_requests:1,verification};
 }
 
 async function syncPending(token:string){
@@ -777,7 +843,7 @@ async function syncPending(token:string){
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v20",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v22",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
