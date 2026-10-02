@@ -51,14 +51,16 @@ function serviceAccount(){
 }
 async function googleReadFetch(url:string,token:string,label:string){
   let lastStatus=0,lastText="";
+  const backoff=[5000,15000,30000,45000];
   for(let attempt=0;attempt<4;attempt++){
     const r=await fetch(url,{headers:{Authorization:"Bearer "+token}});
     lastStatus=r.status;
     if(r.ok)return r;
     lastText=await r.text();
     if(![429,500,502,503,504].includes(r.status))break;
+    if(attempt===3)break;
     const retryAfter=Number(r.headers.get("retry-after")||0);
-    const waitMs=retryAfter>0?retryAfter*1000:[1200,2500,5000,8500][attempt];
+    const waitMs=retryAfter>0?Math.min(60000,retryAfter*1000):backoff[attempt];
     await new Promise(resolve=>setTimeout(resolve,waitMs));
   }
   throw new Error(label+"_"+lastStatus+":"+lastText);
@@ -100,13 +102,26 @@ function updateRows(sheetId:number,rows:any[][],maxCols=26,maxRows=1000){
   return reqs;
 }
 async function batchUpdate(id:string,requests:any[],token:string){
-  const r=await fetch("https://sheets.googleapis.com/v4/spreadsheets/"+id+":batchUpdate",{
-    method:"POST",
-    headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"},
-    body:JSON.stringify({requests,includeSpreadsheetInResponse:false})
-  });
-  if(!r.ok)throw new Error("sheet_batch_"+r.status+":"+await r.text());
-  return await r.json();
+  const url="https://sheets.googleapis.com/v4/spreadsheets/"+id+":batchUpdate";
+  const body=JSON.stringify({requests,includeSpreadsheetInResponse:false});
+  let lastStatus=0,lastText="";
+  const backoff=[5000,15000,30000,45000];
+  for(let attempt=0;attempt<4;attempt++){
+    const r=await fetch(url,{
+      method:"POST",
+      headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"},
+      body
+    });
+    lastStatus=r.status;
+    if(r.ok)return await r.json();
+    lastText=await r.text();
+    if(![429,500,502,503,504].includes(r.status))break;
+    if(attempt===3)break;
+    const retryAfter=Number(r.headers.get("retry-after")||0);
+    const waitMs=retryAfter>0?Math.min(60000,retryAfter*1000):backoff[attempt];
+    await new Promise(resolve=>setTimeout(resolve,waitMs));
+  }
+  throw new Error("sheet_batch_"+lastStatus+":"+lastText);
 }
 async function readValues(id:string,range:string,token:string){
   const r=await googleReadFetch(
@@ -843,7 +858,7 @@ async function syncPending(token:string){
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v22",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v23",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
