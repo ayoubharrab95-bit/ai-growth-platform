@@ -722,9 +722,22 @@ async function searchGenericSocrata(source:any,trade:string,geography:string,see
  const rid=String(m.resource_id||"");const fm=m.field_map??{};
  if(!domain||!rid||!fm.company)throw new Error("generic_socrata_missing_metadata");
  const pageSize=Math.min(150,Math.max(25,Number(m.fetch_limit||100)));
- const scanPages=Math.max(2,Math.min(20,Number(m.scan_pages||12)));
- const bucket=Math.floor(Date.now()/(15*60*1000));
- const pageIndex=stableScanHash(String(source?.slug||rid)+"|"+trade+"|"+geography+"|"+seed+"|"+bucket)%scanPages;
+ const scanPages=Math.max(12,Math.min(120,Number(m.scan_pages||60)));
+ const fallbackBucket=Math.floor(Date.now()/(5*60*1000));
+ let pageIndex=stableScanHash(String(source?.slug||rid)+"|"+trade+"|"+geography+"|"+seed+"|"+fallbackBucket)%scanPages;
+ let scanClaim:any=null;
+ try{
+   const {data:claim,error:claimError}=await db.schema("booked_solid").rpc("claim_source_scan_page",{
+     p_source_slug:String(source?.slug||rid),
+     p_page_size:pageSize,
+     p_scan_pages:scanPages
+   });
+   if(!claimError&&claim){
+     scanClaim=claim;
+     const claimedPage=Number(claim?.page_index);
+     if(Number.isFinite(claimedPage)&&claimedPage>=0)pageIndex=claimedPage;
+   }
+ }catch(_e){}
  const requestedOffset=pageIndex*pageSize;
 
  const fetchPage=async(offset:number)=>{
@@ -781,7 +794,15 @@ async function searchGenericSocrata(source:any,trade:string,geography:string,see
   });
   if(results.length>=25)break;
  }
- return {provider:source.slug,results,scan_offset:usedOffset,scan_page_size:pageSize,scan_page_index:Math.floor(usedOffset/pageSize)};
+ return {
+   provider:source.slug,
+   results,
+   scan_offset:usedOffset,
+   scan_page_size:pageSize,
+   scan_page_index:Math.floor(usedOffset/pageSize),
+   scan_cursor:scanClaim?"persistent":"fallback",
+   scan_claim:scanClaim
+  };
 }
 
 async function searchGenericArcGIS(source:any,trade:string,geography:string){
@@ -993,6 +1014,27 @@ async function resolveCompany(job:any){
    const priorGeoDefers=Number(job.payload?.nominatim_defer_count||0);
 
    if(geoCooling){
+    // A trusted source-provided city/state is sufficient to keep the pipeline
+    // moving. Nominatim is enrichment, not a hard gate. Website identity still
+    // has to pass the normal geography checks, and Qualifier thresholds remain
+    // unchanged.
+    if(usefulResolutionLocation(locText)){
+     await db.schema("booked_solid").from("companies").update({
+      metadata:{
+       ...(c.metadata??{}),
+       preflight_version:2,
+       preflight_status:"geocoder_optional_source_location_fallback",
+       preflight_last_attempt_at:new Date().toISOString(),
+       preflight_geocoder_defers:priorGeoDefers,
+       source_location_used:true
+      }
+     }).eq("id",id);
+     return {
+      resolved:false,
+      reason:"nominatim_optional_source_location_fallback",
+      qualification_fallback:await queueQualifyFallback(job,c,"source_location_without_geocoder")
+     };
+    }
     if(priorGeoDefers>=1||Number(job.attempts||0)>=2){
      await db.schema("booked_solid").from("companies").update({
       metadata:{
@@ -1010,12 +1052,29 @@ async function resolveCompany(job:any){
      };
     }
     job.payload={...job.payload,nominatim_defer_count:priorGeoDefers+1};
-    const resumeAt=new Date(Math.max(Date.now()+5*60000,geoCooldownMs+60000)).toISOString();
+    const resumeAt=new Date(Math.min(Date.now()+90*1000,Math.max(Date.now()+60*1000,geoCooldownMs+1000))).toISOString();
     return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{cooldown_until:geoCooldownRaw,nominatim_defer_count:priorGeoDefers+1});
    }
 
    cachedGeo=await resolveLocationWithNominatim(String(c.name||""),locText);
    if(cachedGeo?.error){
+    if(usefulResolutionLocation(locText)){
+     await db.schema("booked_solid").from("companies").update({
+      metadata:{
+       ...(c.metadata??{}),
+       preflight_version:2,
+       preflight_status:"geocoder_error_source_location_fallback",
+       preflight_last_attempt_at:new Date().toISOString(),
+       preflight_last_error:cachedGeo.error,
+       source_location_used:true
+      }
+     }).eq("id",id);
+     return {
+      resolved:false,
+      reason:"nominatim_error_source_location_fallback",
+      qualification_fallback:await queueQualifyFallback(job,c,"source_location_geocoder_error")
+     };
+    }
     if(priorGeoDefers>=1||Number(job.attempts||0)>=2){
      await db.schema("booked_solid").from("companies").update({
       metadata:{
@@ -1034,7 +1093,7 @@ async function resolveCompany(job:any){
      };
     }
     job.payload={...job.payload,nominatim_defer_count:priorGeoDefers+1};
-    const resumeAt=String(cachedGeo.cooldown_until||new Date(Date.now()+30*60000).toISOString());
+    const resumeAt=new Date(Date.now()+90*1000).toISOString();
     return await deferResolveJob(job,c,"nominatim_cooldown",resumeAt,{nominatim_error:cachedGeo.error,nominatim_defer_count:priorGeoDefers+1});
    }
    if(cachedGeo){
