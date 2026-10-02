@@ -191,3 +191,9 @@ Current doctrine:
 Live acceptance after these changes produced new leads automatically, including **LYNDEN SHEET METAL INC** as Qualified (score 70, trigger 35) in about **4.81 minutes**, and **DIMENSIONAL COMMUNICATIONS INC** as a new Candidate in about **2.95 minutes**, without manual worker dispatch.
 
 If flow becomes bursty again, inspect **cursor progress → Nominatim deferrals → Resolve backlog → pg_net response age/queue → event+cron dispatch amplification** before changing scoring thresholds or source safety gates.
+
+## Source exploration cycle guard (v3)
+
+A planner cycle may contain **at most one mature zero-yield source job**. Extra mature zero-yield routed candidates are skipped and replaced by the next safe routable Proven/Testing candidate. This preserves source learning without allowing zero-yield exploration to consume most of the Resolve pipeline.
+
+Acceptance evidence after the continuity fixes included **3 KINGS ENVIRONMENTAL INC → Qualified + HOT**, score 96, Opportunity 80, Trigger 40, from Washington L&I.
