@@ -583,6 +583,7 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   const reviewCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="REVIEW").length;
   const enrichCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="ENRICH").length;
   const watchCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="WATCH").length;
+  const pendingReadinessCount=qualifiedRevenue.filter((x:any)=>!["ACT NOW","REVIEW","ENRICH","WATCH"].includes(String(x.rev?.readiness||"").toUpperCase())).length;
   const courtneyTop=qualifiedRevenue
     .slice()
     .sort((a:any,b:any)=>
@@ -844,7 +845,7 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
         return [
           c.name||"",
           fmtPri(l.priority_band),
-          String(rev.readiness||"—").toUpperCase(),
+          String(rev.readiness||"PENDING SCORE").toUpperCase(),
           Number(l.opportunity_score)||0,
           cr.decision_maker_known?(cr.decision_maker_name||""):"",
           cr.decision_maker_known?(cr.decision_maker_role||""):"",
@@ -869,11 +870,11 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
         rows:[{values:[
           cell("ACT NOW"),cell(actNowCount),cell("REVIEW"),cell(reviewCount),
           cell("ENRICH"),cell(enrichCount),cell("WATCH"),cell(watchCount),
-          cell("NEEDS DECISION MAKER"),cell(Math.max(0,qualified.length-namedDM))
+          cell("PENDING SCORE"),cell(pendingReadinessCount)
         ]}],
         fields:"userEnteredValue"
       }},
-      single(13,0,"Lead Strength: HOT "+Number(priCounts.hot||0)+" • HIGH "+Number(priCounts.high||0)+" • SIGNAL "+Number(priCounts.signal||0)+" • STANDARD "+Number(priCounts.standard||0)+"  |  Sales Readiness: ACT NOW "+actNowCount+" • REVIEW "+reviewCount+" • ENRICH "+enrichCount+" • WATCH "+watchCount+"  |  Work Sales Readiness first, then Lead Strength • Live from SolidOS: "+nowIso),
+      single(13,0,"Lead Strength: HOT "+Number(priCounts.hot||0)+" • HIGH "+Number(priCounts.high||0)+" • SIGNAL "+Number(priCounts.signal||0)+" • STANDARD "+Number(priCounts.standard||0)+"  |  Sales Readiness: ACT NOW "+actNowCount+" • REVIEW "+reviewCount+" • ENRICH "+enrichCount+" • WATCH "+watchCount+" • PENDING SCORE "+pendingReadinessCount+"  |  Needs Decision Maker "+Math.max(0,qualified.length-namedDM)+"  |  Work Sales Readiness first, then Lead Strength • Live from SolidOS: "+nowIso),
       ...updateRangeRows(cs,14,0,topRows,11,11)
     ];
     await batchUpdate(id,requests,token);
@@ -973,7 +974,7 @@ async function syncPending(token:string){
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v29",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v31",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
