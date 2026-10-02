@@ -101,6 +101,22 @@ function updateRows(sheetId:number,rows:any[][],maxCols=26,maxRows=1000){
   }
   return reqs;
 }
+function updateRangeRows(sheetId:number,startRowIndex:number,startColumnIndex:number,rows:any[][],clearRows:number,clearCols:number){
+  const reqs:any[]=[
+    {repeatCell:{
+      range:{sheetId,startRowIndex,endRowIndex:startRowIndex+clearRows,startColumnIndex,endColumnIndex:startColumnIndex+clearCols},
+      cell:{userEnteredValue:{}},fields:"userEnteredValue"
+    }}
+  ];
+  if(rows.length){
+    reqs.push({updateCells:{
+      start:{sheetId,rowIndex:startRowIndex,columnIndex:startColumnIndex},
+      rows:rows.map(r=>({values:r.map(cell)})),
+      fields:"userEnteredValue"
+    }});
+  }
+  return reqs;
+}
 async function batchUpdate(id:string,requests:any[],token:string){
   const url="https://sheets.googleapis.com/v4/spreadsheets/"+id+":batchUpdate";
   const body=JSON.stringify({requests,includeSpreadsheetInResponse:false});
@@ -437,7 +453,8 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
     "DATA QUALITY":["leads","contacts","evidence","messages"],
     "HOURLY LOG":[],
     "SYSTEM STATUS":["companies","leads","contacts","evidence","messages","priority"],
-    "PRIORITY ENGINE":["leads","priority"]
+    "PRIORITY ENGINE":["leads","priority"],
+    "START HERE — COURTNEY":["companies","leads","contacts","priority"]
   };
   const wants=(tab:string)=>fullMode||(tabDeps[tab]||[]).some(t=>changed.has(t));
 
@@ -455,6 +472,15 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
     fetchAllBooked("priority_enrichment_log","*","updated_at",false),
     fetchAllBooked("source_lead_yield_snapshot","*","yield_score",false)
   ]);
+
+  const {data:revenueRowsRaw,error:revenueRowsError}=await db
+    .from("solidos_revenue_sheet_rows")
+    .select("company_id,lead_id,company_name,readiness,target_score,priority_band,best_offer,why_now,opportunity_score,trigger_score")
+    .not("lead_id","is",null)
+    .order("target_score",{ascending:false})
+    .limit(500);
+  if(revenueRowsError)throw new Error("core_revenue_rows:"+revenueRowsError.message);
+  const revenueRows=revenueRowsRaw||[];
 
   const settings=settingsRows?.[0]||{};
   const companyById=new Map(companies.map((c:any)=>[c.id,c]));
@@ -541,6 +567,29 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
     if(key==="email")return cr.recipient_email||bc.email||"";
     return "";
   };
+
+  const readinessRank=(x:any)=>{
+    const r=String(x||"").toUpperCase();
+    return r==="ACT NOW"?4:r==="REVIEW"?3:r==="ENRICH"?2:r==="WATCH"?1:0;
+  };
+  const revenueByLead=new Map<string,any>();
+  for(const r of revenueRows){
+    if(!r?.lead_id)continue;
+    const k=String(r.lead_id),prev=revenueByLead.get(k);
+    if(!prev||Number(r.target_score||0)>Number(prev.target_score||0))revenueByLead.set(k,r);
+  }
+  const qualifiedRevenue=qualified.map((l:any)=>({l,rev:revenueByLead.get(String(l.id))||null}));
+  const actNowCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="ACT NOW").length;
+  const reviewCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="REVIEW").length;
+  const courtneyTop=qualifiedRevenue
+    .slice()
+    .sort((a:any,b:any)=>
+      readinessRank(b.rev?.readiness)-readinessRank(a.rev?.readiness) ||
+      Number(b.rev?.target_score||0)-Number(a.rev?.target_score||0) ||
+      priRank(b.l?.priority_band)-priRank(a.l?.priority_band) ||
+      Number(b.l?.opportunity_score||0)-Number(a.l?.opportunity_score||0)
+    )
+    .slice(0,10);
 
   const readyIds=new Set(ready.map((l:any)=>l.id));
   const msgCount=new Map<string,number>();
@@ -776,6 +825,59 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   await writeIf("SYSTEM STATUS",sys,300,10);
   await writeIf("PRIORITY ENGINE",priorityEngine,1000,11);
 
+  if(wants("START HERE — COURTNEY")){
+    const courtneyName="START HERE — COURTNEY";
+    if(sm[courtneyName]===undefined)throw new Error("CORE:missing_tab:"+courtneyName);
+    await ensureTabCapacity(id,sm,courtneyName,118,11,token);
+    const cs=sm[courtneyName];
+    const single=(rowIndex:number,colIndex:number,value:any)=>({updateCells:{
+      start:{sheetId:cs,rowIndex,columnIndex:colIndex},
+      rows:[{values:[cell(value)]}],
+      fields:"userEnteredValue"
+    }});
+    const topRows=[
+      ["Company","Priority","Readiness","Opportunity","Decision Maker","Role / Title","Email","Phone","Why Now","Offer","Action"],
+      ...courtneyTop.map((x:any)=>{
+        const l=x.l,rev=x.rev||{},c=companyById.get(l.company_id)||{},cr=contactResolution(l);
+        return [
+          c.name||"",
+          fmtPri(l.priority_band),
+          String(rev.readiness||"—").toUpperCase(),
+          Number(l.opportunity_score)||0,
+          cr.decision_maker_known?(cr.decision_maker_name||""):"",
+          cr.decision_maker_known?(cr.decision_maker_role||""):"",
+          contactValue(l,"email"),
+          contactValue(l,"phone"),
+          rev.why_now||l.why_now||"",
+          rev.best_offer||l.offer||c.recommended_offer||"",
+          actionFor(l)
+        ];
+      })
+    ];
+    while(topRows.length<11)topRows.push(["","","","","","","","","","",""]);
+    const requests:any[]=[
+      single(5,0,qualified.length),
+      single(5,2,Number(priCounts.hot||0)),
+      single(5,4,Number(priCounts.high||0)),
+      single(8,0,ready.length),
+      single(8,2,namedDM),
+      single(8,4,contactForms.length),
+      {updateCells:{
+        start:{sheetId:cs,rowIndex:12,columnIndex:0},
+        rows:[{values:[
+          cell("ACT NOW"),cell(actNowCount),cell("REVIEW"),cell(reviewCount),
+          cell("HOT"),cell(Number(priCounts.hot||0)),cell("HIGH"),cell(Number(priCounts.high||0)),
+          cell("NEEDS DECISION MAKER"),cell(Math.max(0,qualified.length-namedDM))
+        ]}],
+        fields:"userEnteredValue"
+      }},
+      single(13,0,"Priority = HOT/HIGH strength • Readiness = ACT NOW/REVIEW/ENRICH/WATCH revenue action • Live from SolidOS: "+nowIso),
+      ...updateRangeRows(cs,14,0,topRows,11,11)
+    ];
+    await batchUpdate(id,requests,token);
+    writtenTabs.push(courtneyName);
+  }
+
   const verifyRanges:string[]=["COMMAND CENTER!A1:H25"];
   if(wants("ACTION QUEUE"))verifyRanges.push("ACTION QUEUE!A1:Q");
   if(wants("QUALIFIED 360"))verifyRanges.push("QUALIFIED 360!A1:A");
@@ -786,6 +888,7 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   if(wants("EVIDENCE"))verifyRanges.push("EVIDENCE!A1:A");
   if(wants("TRADE SUMMARY"))verifyRanges.push("TRADE SUMMARY!A1:F1");
   if(wants("PRIORITY ENGINE"))verifyRanges.push("PRIORITY ENGINE!A1:K4");
+  if(wants("START HERE — COURTNEY"))verifyRanges.push("'START HERE — COURTNEY'!A15:K25");
 
   const vv=await batchReadValues(id,verifyRanges,token);
   const check=vv["COMMAND CENTER!A1:H25"]||{values:[]};
@@ -838,6 +941,12 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
     const priorityCheck=vv["PRIORITY ENGINE!A1:K4"]||{values:[]};
     if(String(priorityCheck.values?.[0]?.[0]||"")!=="PRIORITY YIELD ENGINE")throw new Error("CORE:verify_priority_engine_header");
   }
+  if(wants("START HERE — COURTNEY")){
+    const courtneyCheck=vv["'START HERE — COURTNEY'!A15:K25"]||{values:[]};
+    if(String(courtneyCheck.values?.[0]?.[0]||"")!=="Company")throw new Error("CORE:verify_courtney_header");
+    if(String(courtneyCheck.values?.[0]?.[2]||"")!=="Readiness")throw new Error("CORE:verify_courtney_readiness_header");
+    verification.push({tab:"START HERE — COURTNEY",header:"Company",liveRows:Math.max(0,(courtneyCheck.values||[]).length-1)});
+  }
 
   return {ok:true,mode:fullMode?"full":"fast",changed:[...changed],written_tabs:writtenTabs,
     companies:companies.length,leads:leads.length,qualified:qualified.length,candidates:candidates.length,
@@ -861,7 +970,7 @@ async function syncPending(token:string){
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v25",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v28",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
