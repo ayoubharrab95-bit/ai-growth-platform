@@ -290,3 +290,24 @@ Current display coverage:
 Verified examples include **Marcus Kuhlmann — Founder**, **Gayland Looney — Owner**, **Dennis Porter — President**, and **Matt Campbell — Principal**.
 
 Known-good sheet baseline: **Sheet Sync v25 + Revenue CRM Writer v4**. This is display-only; scoring, qualification, source routing, contact extraction, and outreach remain unchanged.
+
+## Sheet Quota Guard + Brain Rollback Hold v8
+
+A real Google Sheets quota incident occurred at **2026-10-02 12:47 UTC**: CORE_CRM hit the per-user write-request limit. The failure was caused by overlapping Core/Commercial sheet activity and high-frequency fast dispatch, not by bad CRM data.
+
+Current sheet safeguards:
+- `claim_solidos_sheet_sync()` is globally serialized with a Postgres advisory transaction lock;
+- only **one** sheet scope may be RUNNING at a time across CORE_CRM and COMMERCIAL_PRODUCTS;
+- enforce a **60-second global cooloff** after a completed sheet sync before another scope can start;
+- fast Core event dispatch uses a **60-second bucket** (cron fallback remains every minute);
+- health events use valid severity `WARN` rather than `warning` / `WARNING`.
+
+Acceptance after the guard: **0 overlapping writers**, observed start gap **118 seconds**, **0 new quota/429 failures**, and a Commercial Products sync completed and verified successfully.
+
+### Failed experiment to remember
+
+A broad batching refactor was deployed briefly as platform Sheet Sync **v26** and failed at function boot before any writes. It was immediately rolled back. The active platform deployment is **v27**, using the known-good v25 source hash plus the database-level serialization/quota guards above. Do not retry the v26 batching refactor directly without offline compile/test.
+
+### Strategy Brain rollback hold
+
+Strategy Brain is intentionally at **15%** after Auto-Rollback. Stable pct is 15%, and the rollback hold runs until **2026-10-03 00:07 UTC**. Do **not** manually ramp during the hold. Canary performance was below Legacy in the post-rollback sample, and the rollback was triggered by real pipeline/SLA pressure. Let AutoPilot evaluate after the hold and only ramp when health and sample gates pass.
