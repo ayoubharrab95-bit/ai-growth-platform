@@ -423,6 +423,9 @@ async function writeTab(id:string,sm:any,name:string,rows:any[][],token:string,m
   await writeAnyTab(id,sm,name,rows,token,maxRows,maxCols);
 }
 async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any={}){
+  const identityGuard=true;
+  const displayName=(cr:any)=>identityGuard?(cr.decision_maker_known?(cr.decision_maker_name||""):""):(cr.decision_maker_name||cr.recipient_name||"");
+  const displayRole=(cr:any)=>identityGuard?(cr.decision_maker_known?(cr.decision_maker_role||""):""):(cr.decision_maker_role||cr.recipient_role||"");
   const id=TARGETS.CORE_CRM.id;
   let meta=await sheetMetadata(id,token);
   let sm=sheetIdMap(meta);
@@ -650,7 +653,7 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
       const c=companyById.get(l.company_id)||{}, cr=contactResolution(l), m=manual.get(String(l.id))||["Not Reviewed","","",""];
       return [
         c.name||"",fmtPri(l.priority_band),Number(l.opportunity_score)||0,c.trade||"",
-        cr.decision_maker_name||cr.recipient_name||"",cr.decision_maker_role||cr.recipient_role||"",
+        displayName(cr),displayRole(cr),
         contactValue(l,"email"),contactValue(l,"phone"),l.why_now||"",l.offer||c.recommended_offer||"",
         actionFor(l),m[0],m[1],m[2],m[3],l.id,l.company_id
       ];
@@ -673,7 +676,7 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
     ...qualified.map((l:any)=>{
       const c=companyById.get(l.company_id)||{},cr=contactResolution(l);
       return [c.name||"",fmtPri(l.priority_band),Number(l.opportunity_score)||0,c.trade||"",
-        cr.decision_maker_name||cr.recipient_name||"",cr.decision_maker_role||cr.recipient_role||"",
+        displayName(cr),displayRole(cr),
         contactValue(l,"email"),contactValue(l,"phone"),routeLabel(l),cr.contact_form_url||"",l.why_now||"",
         l.offer||c.recommended_offer||"",c.website_url||"",c.location_text||"",c.state||"",searchMarket(c),l.id,l.company_id];
     })];
@@ -725,8 +728,8 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   const gaps=[["Company","Priority","Opportunity","Decision Maker","Role","Email","Phone","Route Status","Next Action","Lead ID"],
     ...qualified.map((l:any)=>{
       const c=companyById.get(l.company_id)||{},cr=contactResolution(l);
-      return [c.name||"",fmtPri(l.priority_band),Number(l.opportunity_score)||0,cr.decision_maker_name||cr.recipient_name||"",
-        cr.decision_maker_role||cr.recipient_role||"",contactValue(l,"email"),contactValue(l,"phone"),routeLabel(l),actionFor(l),l.id];
+      return [c.name||"",fmtPri(l.priority_band),Number(l.opportunity_score)||0,displayName(cr),
+        displayRole(cr),contactValue(l,"email"),contactValue(l,"phone"),routeLabel(l),actionFor(l),l.id];
     })];
 
   const dq=[["Check","Status","Count","Note"],
@@ -974,7 +977,7 @@ async function syncPending(token:string){
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v31",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v33",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
