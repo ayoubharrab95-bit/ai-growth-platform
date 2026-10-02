@@ -341,3 +341,23 @@ Courtney workflow shown directly on the page:
 5. Record review/follow-up in ACTION QUEUE.
 
 Important stability rule: **do not add a separate Courtney Sales Desk cron/writer unless formulas become insufficient**. The current formula-driven design creates no new recurring Google write load.
+
+## Courtney Sales Desk — Priority vs Readiness (v9)
+
+The tab **START HERE — COURTNEY** is a live sales work surface updated by the existing CORE_CRM Sheet Sync. Do **not** create a separate Courtney cron/writer.
+
+Keep these concepts separate:
+- **Priority** = lead strength: HOT / HIGH / SIGNAL / STANDARD.
+- **Readiness** = revenue action state: ACT NOW / REVIEW / ENRICH / WATCH.
+
+Courtney's work order is:
+1. Readiness first: **ACT NOW → REVIEW → ENRICH/WATCH**.
+2. Within the same Readiness, work **HOT before HIGH**.
+3. Then use Opportunity, Decision Maker, Why Now, Offer, and Action to decide the outreach angle.
+
+The live worklist columns are:
+**Company | Priority | Readiness | Opportunity | Decision Maker | Role / Title | Email | Phone | Why Now | Offer | Action**.
+
+Ranking is by Readiness, Revenue Score, Priority, then Opportunity. Decision Maker/Role appear only when verified. A general company inbox is a route, not automatically that named person's personal email.
+
+Acceptance: CORE_CRM request 18579 completed SUCCEEDED under Sheet Sync **v28**, verified the Courtney tab, and wrote 10 live priority rows with the new Readiness column.
