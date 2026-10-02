@@ -581,6 +581,8 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   const qualifiedRevenue=qualified.map((l:any)=>({l,rev:revenueByLead.get(String(l.id))||null}));
   const actNowCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="ACT NOW").length;
   const reviewCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="REVIEW").length;
+  const enrichCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="ENRICH").length;
+  const watchCount=qualifiedRevenue.filter((x:any)=>String(x.rev?.readiness||"").toUpperCase()==="WATCH").length;
   const courtneyTop=qualifiedRevenue
     .slice()
     .sort((a:any,b:any)=>
@@ -836,7 +838,7 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
       fields:"userEnteredValue"
     }});
     const topRows=[
-      ["Company","Priority","Readiness","Opportunity","Decision Maker","Role / Title","Email","Phone","Why Now","Offer","Action"],
+      ["Company","Lead Strength","Sales Readiness","Opportunity","Decision Maker","Role / Title","Email","Phone","Why Now","Offer","Action"],
       ...courtneyTop.map((x:any)=>{
         const l=x.l,rev=x.rev||{},c=companyById.get(l.company_id)||{},cr=contactResolution(l);
         return [
@@ -866,12 +868,12 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
         start:{sheetId:cs,rowIndex:12,columnIndex:0},
         rows:[{values:[
           cell("ACT NOW"),cell(actNowCount),cell("REVIEW"),cell(reviewCount),
-          cell("HOT"),cell(Number(priCounts.hot||0)),cell("HIGH"),cell(Number(priCounts.high||0)),
+          cell("ENRICH"),cell(enrichCount),cell("WATCH"),cell(watchCount),
           cell("NEEDS DECISION MAKER"),cell(Math.max(0,qualified.length-namedDM))
         ]}],
         fields:"userEnteredValue"
       }},
-      single(13,0,"Priority = HOT/HIGH strength • Readiness = ACT NOW/REVIEW/ENRICH/WATCH revenue action • Live from SolidOS: "+nowIso),
+      single(13,0,"Lead Strength: HOT "+Number(priCounts.hot||0)+" • HIGH "+Number(priCounts.high||0)+" • SIGNAL "+Number(priCounts.signal||0)+" • STANDARD "+Number(priCounts.standard||0)+"  |  Sales Readiness: ACT NOW "+actNowCount+" • REVIEW "+reviewCount+" • ENRICH "+enrichCount+" • WATCH "+watchCount+"  |  Work Sales Readiness first, then Lead Strength • Live from SolidOS: "+nowIso),
       ...updateRangeRows(cs,14,0,topRows,11,11)
     ];
     await batchUpdate(id,requests,token);
@@ -944,7 +946,8 @@ async function coreSync(token:string,mode:"full"|"fast"="full",changePayload:any
   if(wants("START HERE — COURTNEY")){
     const courtneyCheck=vv["'START HERE — COURTNEY'!A15:K25"]||{values:[]};
     if(String(courtneyCheck.values?.[0]?.[0]||"")!=="Company")throw new Error("CORE:verify_courtney_header");
-    if(String(courtneyCheck.values?.[0]?.[2]||"")!=="Readiness")throw new Error("CORE:verify_courtney_readiness_header");
+    if(String(courtneyCheck.values?.[0]?.[1]||"")!=="Lead Strength")throw new Error("CORE:verify_courtney_strength_header");
+    if(String(courtneyCheck.values?.[0]?.[2]||"")!=="Sales Readiness")throw new Error("CORE:verify_courtney_readiness_header");
     verification.push({tab:"START HERE — COURTNEY",header:"Company",liveRows:Math.max(0,(courtneyCheck.values||[]).length-1)});
   }
 
@@ -970,7 +973,7 @@ async function syncPending(token:string){
       else if(req.sync_scope==="COMMERCIAL_PRODUCTS")result=await commercialSync(token);
       else throw new Error("unknown_sync_scope:"+req.sync_scope);
 
-      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v28",result};
+      const verificationPayload={verified_at:new Date().toISOString(),writer:"solidos-sheet-sync-v29",result};
       const {data:auditOk,error:auditErr}=await db.rpc("record_solidos_sheet_sync_verification",{p_id:req.id,p_verification:verificationPayload});
       if(auditErr||auditOk!==true)throw new Error("persist_sync_verification:"+(auditErr?.message||"not_recorded"));
 
