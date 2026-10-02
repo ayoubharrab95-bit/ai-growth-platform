@@ -38,6 +38,7 @@ function angleFor(types:Set<string>,trade:string){
  if(types.has("field_quoting")) return "speed_to_quote";
  if(types.has("scale_signal")) return "consistency_at_scale";
  if(types.has("estimation_pain")) return "estimate_speed_and_margin";
+ if(types.has("website_conversion_gap")&&types.has("seo_foundation_gap")) return "digital_conversion";
  return "workflow_fit";
 }
 function offerKeyFor(lead:any,types:Set<string>,trade:string){
@@ -45,6 +46,7 @@ function offerKeyFor(lead:any,types:Set<string>,trade:string){
  const joined=JSON.stringify(lead.lead_brief||{}).toLowerCase();
  if(types.has("workflow_complexity") && /(buildertrend|monthly software|saas|generic platform|software overload)/.test(joined)) return "buildertrend_alternative";
  if(trade==="Property Operations" && (types.has("property_operations")||types.has("workflow_complexity")||types.has("scale_signal"))) return "automation";
+ if(lead.offer==="website_growth") return "website_growth";
  return lead.offer==="automation"?"automation":lead.offer==="penmark"?"penmark":"custom_estimator";
 }
 function observationFor(types:Set<string>,trade:string,company:string,evidence:any[]){
@@ -57,6 +59,9 @@ function observationFor(types:Set<string>,trade:string,company:string,evidence:a
  if(trigger?.evidence_type==="trigger_change_order_workflow") return "I noticed change orders or scope changes are part of the workflow, where clean approvals and updated job value can protect margin.";
  if(trigger?.evidence_type==="trigger_recurring_service") return "I noticed "+company+" has recurring service or maintenance workflows, which often create repetitive admin and follow-up work.";
  if(trigger?.evidence_type==="trigger_active_hiring") return "I noticed "+company+" is actively hiring, which can be a sign the team is adding capacity and operational workload.";
+ const conversionGap=evidence.find(x=>x.evidence_type==="website_conversion_gap");
+ const seoGap=evidence.find(x=>x.evidence_type==="seo_foundation_gap");
+ if(conversionGap&&seoGap) return "I reviewed the public site for "+company+" and the sampled HTML did not expose a clear quote/contact conversion path, meta description, or business structured-data markup.";
  const permit=evidence.find(x=>x.evidence_type==="permit_activity");
  const assoc=evidence.find(x=>x.evidence_type==="association_membership");
  if(permit) return "I came across recent permit activity tied to "+company+", which usually means the estimating and handoff process has to stay tight as projects move.";
@@ -70,6 +75,7 @@ function observationFor(types:Set<string>,trade:string,company:string,evidence:a
 }
 function valueFor(angle:string,offer:string){
  if(offer==="penmark") return "PenMark keeps change orders, approvals, photos and updated job value in one clean workflow — without adding a monthly software bill.";
+ if(offer==="website_growth") return "Booked Solid builds contractor websites around clearer conversion paths, stronger service positioning, local-search foundations and copy designed to turn existing traffic into better inquiries.";
  if(angle==="operational_leverage") return "Booked Solid builds custom automation around the workflow a team already uses, so repetitive admin and handoffs can happen with fewer manual steps.";
  if(angle==="speed_to_quote") return "Booked Solid builds custom estimating tools that can turn quote preparation from hours into minutes while keeping pricing logic and branded proposals consistent.";
  if(angle==="capacity_without_more_admin") return "The idea is to let the team handle more estimating volume without adding the same amount of admin work.";
@@ -77,6 +83,7 @@ function valueFor(angle:string,offer:string){
  return "Booked Solid builds custom estimating software around the way a contractor already prices and sells work — with no monthly software fee and full code ownership.";
 }
 function costFrame(angle:string){
+ if(angle==="digital_conversion") return "When a contractor already has traffic but the site does not make the next step obvious, the hidden cost is often qualified visitors leaving before they request a quote or contact the team.";
  if(angle==="operational_leverage") return "If even a few recurring owner, property or internal handoffs are still being copied between tools, the cost usually shows up as staff time and slower follow-through rather than as a single obvious line item.";
  if(angle==="speed_to_quote"||angle==="estimate_speed_and_margin") return "If estimates still require several manual lookups, spreadsheet steps or proposal edits, the hidden cost is not only admin time — it is also how long a good prospect waits before receiving a clean number.";
  if(angle==="capacity_without_more_admin") return "When demand grows, the bottleneck often becomes the amount of quoting and coordination each additional job creates.";
