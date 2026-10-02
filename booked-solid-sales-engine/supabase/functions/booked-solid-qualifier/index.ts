@@ -10,6 +10,15 @@ function tradeFromIdentity(name:string,domain:string,current?:string|null){
  if(x.includes("paint"))m.push("Painting");if(x.includes("fence"))m.push("Fence");if(x.includes("cabinet"))m.push("Cabinet");
  const u=[...new Set(m)];if(current&&u.includes(String(current)))return String(current);return u.length===1?u[0]:null;
 }
+function strategyTradeCompatible(strategyTrade:string,companyTrade:string){
+ const s=String(strategyTrade||"Mixed"),c=String(companyTrade||"").trim();
+ if(!s||s==="Mixed"||!c)return true;
+ if(s===c)return true;
+ if(["Roofing","Commercial Roofing"].includes(s)&&c==="Roofing")return true;
+ if(["HVAC","Commercial HVAC"].includes(s)&&c==="HVAC")return true;
+ if(["General Contractor","Commercial Contractor","Construction"].includes(s)&&["General Contractor","Commercial Contractor","Construction","Remodeling"].includes(c))return true;
+ return false;
+}
 function weakMailbox(email:string){const e=String(email||"").toLowerCase();const lp=e.split("@")[0];return !lp||lp.length<2||["first","firstname","test","example"].includes(lp)||/(employment|careers?|jobs?|support|concierge|reservations?|dining|spa|events?|groups?|humanresources|human-resources|noreply|no-reply|donotreply|do-not-reply)/.test(lp)||lp==="hr"}
 function triggerSummary(rows:any[]){
  const best=new Map<string,any>();
@@ -34,6 +43,16 @@ Deno.serve(async req=>{
   const rows=evidence??[];
   const types=new Set(rows.map((x:any)=>x.evidence_type));const triggers=triggerSummary(rows);const triggerScore=triggers.score;
   const identityTrade=tradeFromIdentity(company.name,company.canonical_domain,company.trade);if(identityTrade&&identityTrade!==company.trade){await db.schema("booked_solid").from("companies").update({trade:identityTrade,updated_at:new Date().toISOString(),metadata:{...(company.metadata??{}),trade_corrected_from_identity:true,previous_trade:company.trade??null}}).eq("id",id);company.trade=identityTrade;}
+  let attributedStrategyId=b.strategy_id??company.metadata?.discovery_strategy_id??null;
+  if(attributedStrategyId){
+    const {data:strategyRow}=await db.schema("booked_solid").from("search_strategies").select("id,slug,trade").eq("id",attributedStrategyId).maybeSingle();
+    if(strategyRow&&!strategyTradeCompatible(String(strategyRow.trade||"Mixed"),String(company.trade||""))){
+      attributedStrategyId=null;
+      const mismatchMeta={...(company.metadata??{}),strategy_attribution_valid:false,strategy_trade_mismatch:true,strategy_trade_mismatch_strategy:strategyRow.slug,strategy_trade_mismatch_strategy_trade:strategyRow.trade,strategy_trade_mismatch_company_trade:company.trade,strategy_trade_mismatch_at:new Date().toISOString()};
+      await db.schema("booked_solid").from("companies").update({metadata:mismatchMeta,updated_at:new Date().toISOString()}).eq("id",id);
+      company.metadata=mismatchMeta;
+    }
+  }
   const text=((company.name??"")+" "+(company.normalized_name??"")+" "+rows.map((x:any)=>((x.claim??"")+" "+(x.snippet??""))).join(" ")).toLowerCase();
   const vendorTerms=["software company","software platform","saas","software provider","technology platform","proptech","property management software","estimation software","estimating software","crm software","workflow software","ai platform","api","marketplace","software solution","technology company"];
   const operatorTerms=["property management company","property manager","property management services","rental management","vacation rental management","apartment management","real estate management services"];
@@ -65,11 +84,16 @@ Deno.serve(async req=>{
   const status=priorQualified?"qualified":score>=65&&realEvidenceTypes.size>=1?"qualified":score>=40?"candidate":"rejected";
   const priorBrief=(existingLeads??[]).find((x:any)=>x.status==="qualified")?.lead_brief??(existingLeads??[])[0]?.lead_brief??{};
   const {data:lead,error:le}=await db.schema("booked_solid").from("leads").upsert({
-    company_id:id,contact_id:usableContact?.id??null,offer,score,
+    company_id:id,contact_id:usableContact?.id??null,strategy_id:attributedStrategyId,offer,score,
     fit_score:fit,pain_score:pain,evidence_score:evidenceScore,contact_score:contactScore,trigger_score:triggerScore,opportunity_score:opportunityScore,priority_band:priorityBand,status,
     why_now:why,lead_brief:{...priorBrief,evidence_types:[...types],company:company.name,website:company.website_url,prospect_type:prospectType,contact_status:contact?"unverified":"missing",trigger_summary:{score:triggerScore,types:triggers.items.map((x:any)=>x.evidence_type),strongest_type:triggers.strongest?.evidence_type||null,strongest_claim:triggers.strongest?.claim||null,updated_at:new Date().toISOString()},micro_audit:{headline:triggers.strongest?.claim||why,findings:triggers.items.slice(0,3).map((x:any)=>({type:x.evidence_type,claim:x.claim,source_url:x.source_url,confidence:x.confidence})),generated_from_public_evidence:true}}
   },{onConflict:"company_id,offer"}).select("*").single();
   if(le)throw le;
+  const {error:strategyUpdateError}=await db.schema("booked_solid").from("leads")
+    .update({strategy_id:attributedStrategyId,updated_at:new Date().toISOString()})
+    .eq("id",lead.id);
+  if(strategyUpdateError)throw strategyUpdateError;
+  lead.strategy_id=attributedStrategyId;
   if(status==="qualified"){
    const {data:cq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","contact").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
    if(!(cq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:score+10+Math.min(15,triggerScore*0.15),payload:{lead_id:lead.id,company_id:id},status:"pending"});
