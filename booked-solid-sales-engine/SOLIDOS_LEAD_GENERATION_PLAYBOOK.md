@@ -416,3 +416,11 @@ Measurement cautions:
 The development sequence is: observe corrected baseline; test a small Phoenix compatible-market slot; compare Qualified/HOT-HIGH and route yield per unique company and worker capacity; improve only proven latency bottlenecks; profile narrow Sheet reads offline before any batching canary; let AutoPilot govern Brain. No source mix/capacity/score optimization was deployed in this audit.
 
 See SOLIDOS_AUDIT_AND_DEVELOPMENT_PLAN_2026-10-02.md for source comparison, acceptance checks, rollback instructions and the staged plan.
+
+## v12 — OSM scoped internal discovery canary result
+
+OSM remains historically strong: recent source yield showed about 125 valid leads, 43 Qualified, and 14 HOT/HIGH. I implemented the missing guard that prevents OSM/ODbL data from becoming `COMMERCIAL_SAFE` when `commercial_resale_allowed=false`; such assets are now `INTERNAL_ONLY` with resale/attribution restriction reasons.
+
+The production canary did not pass. A single OSM Phoenix HVAC discover job `db4b065d-7887-4919-961e-e6c39f2d3223` first failed with `overpass_http_406`. Worker v124 reduced OSM discovery radius from 40km to 15km, changed Overpass timeout to 8s, capped discovery output at 25 rows, and prefers `overpass-api.de`, but the Edge Runtime still returned `overpass_http_0`. No OSM companies or leads were produced by the canary.
+
+Keep OSM in Technical Recovery until an Edge Runtime probe succeeds. Do not re-enable OSM production discovery merely because an off-platform/local Overpass test succeeds. The next safe step is one successful Edge probe through the existing `solidos-osm-technical-recovery-probe`; only then set OSM back to an internal-only ALLOWED canary and queue one discover job.
