@@ -583,16 +583,19 @@ async function planCycle(body: any) {
       else if(testing.length){ lane="testing"; pool=testing; }
       else return null;
     }else{
-      if(bucket<35 && proven.length){ lane="proven"; pool=proven; }
-      else if(bucket<65 && testing.length){ lane="testing"; pool=testing; }
+      // Explore strategy ideas mostly on productive/learning sources. This keeps
+      // strategy exploration alive without letting mature zero-yield sources
+      // consume the Resolve pipeline and create visible stop/start behavior.
+      if(bucket<60 && proven.length){ lane="proven"; pool=proven; }
+      else if(bucket<90 && testing.length){ lane="testing"; pool=testing; }
       else{
         lane="exploration";
         const zeroYieldBucket=hashText(String(s.slug)+":"+market+":zero-yield:"+useCount)%100;
-        if(zeroYieldBucket<12&&zeroYieldExploration.length)pool=zeroYieldExploration;
+        if(zeroYieldBucket<8&&zeroYieldExploration.length)pool=zeroYieldExploration;
         else if(freshExploration.length)pool=freshExploration;
-        else if(exploration.length)pool=exploration;
         else if(testing.length){ lane="testing"; pool=testing; }
-        else { lane="proven"; pool=proven; }
+        else if(proven.length){ lane="proven"; pool=proven; }
+        else if(exploration.length)pool=exploration;
       }
     }
 
