@@ -40,7 +40,7 @@ Deno.serve(async req=>{
    db.schema("booked_solid").from("leads").select("id,status,offer,lead_brief").eq("company_id",id)
   ]);
   if(ce)throw ce;if(ee)throw ee;if(cte)throw cte;if(lee)throw lee;
-  const rows=evidence??[];
+  const rows=(evidence??[]).filter((x:any)=>x.metadata?.active!==false);
   const types=new Set(rows.map((x:any)=>x.evidence_type));const triggers=triggerSummary(rows);const triggerScore=triggers.score;
   const identityTrade=tradeFromIdentity(company.name,company.canonical_domain,company.trade);if(identityTrade&&identityTrade!==company.trade){await db.schema("booked_solid").from("companies").update({trade:identityTrade,updated_at:new Date().toISOString(),metadata:{...(company.metadata??{}),trade_corrected_from_identity:true,previous_trade:company.trade??null}}).eq("id",id);company.trade=identityTrade;}
   let attributedStrategyId=b.strategy_id??company.metadata?.discovery_strategy_id??null;
@@ -80,9 +80,10 @@ Deno.serve(async req=>{
   else if(websiteGrowthNeed&&!types.has("estimation_pain")&&!types.has("field_quoting"))offer="website_growth";
   const prospectType=offer==="website_growth"?"digital_led":types.has("estimation_pain")||types.has("field_quoting")||types.has("change_orders")?"pain_led":"fit_led";
   const why=triggers.strongest?.claim||(prospectType==="digital_led"?"Public website evidence shows measurable conversion and SEO-foundation gaps in the sampled HTML.":prospectType==="pain_led"?"Public evidence shows a relevant operational/estimating signal.":"Company appears to fit Booked Solid's target customer profile; no pain is assumed.");
-  const priorQualified=(existingLeads??[]).some((x:any)=>x.status==="qualified");
-  const status=priorQualified?"qualified":score>=65&&realEvidenceTypes.size>=1?"qualified":score>=40?"candidate":"rejected";
-  const priorBrief=(existingLeads??[]).find((x:any)=>x.status==="qualified")?.lead_brief??(existingLeads??[])[0]?.lead_brief??{};
+  const protectedLead=(existingLeads??[]).find((x:any)=>["sent","replied","meeting","won"].includes(String(x.status||"")));
+  const computedStatus=score>=65&&realEvidenceTypes.size>=1?"qualified":score>=40?"candidate":"rejected";
+  const status=protectedLead?String(protectedLead.status):computedStatus;
+  const priorBrief=protectedLead?.lead_brief??(existingLeads??[]).find((x:any)=>x.status==="qualified")?.lead_brief??(existingLeads??[])[0]?.lead_brief??{};
   const {data:lead,error:le}=await db.schema("booked_solid").from("leads").upsert({
     company_id:id,contact_id:usableContact?.id??null,strategy_id:attributedStrategyId,offer,score,
     fit_score:fit,pain_score:pain,evidence_score:evidenceScore,contact_score:contactScore,trigger_score:triggerScore,opportunity_score:opportunityScore,priority_band:priorityBand,status,
@@ -94,12 +95,14 @@ Deno.serve(async req=>{
     .eq("id",lead.id);
   if(strategyUpdateError)throw strategyUpdateError;
   lead.strategy_id=attributedStrategyId;
-  if(status==="qualified"){
-   const {data:cq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","contact").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
-   if(!(cq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:score+10+Math.min(15,triggerScore*0.15),payload:{lead_id:lead.id,company_id:id},status:"pending"});
+  if(["qualified","sent","replied","meeting","won"].includes(status)){
+   if(status==="qualified"){
+    const {data:cq}=await db.schema("booked_solid").from("work_queue").select("id").eq("kind","contact").in("status",["pending","running"]).contains("payload",{lead_id:lead.id}).limit(1);
+    if(!(cq??[]).length)await db.schema("booked_solid").from("work_queue").insert({kind:"contact",priority:score+10+Math.min(15,triggerScore*0.15),payload:{lead_id:lead.id,company_id:id},status:"pending"});
+   }
    await db.schema("booked_solid").from("companies").update({status:"qualified",recommended_offer:offer,fit_score:fit,updated_at:new Date().toISOString()}).eq("id",id);
   } else if(status==="candidate"){
-   await db.schema("booked_solid").from("companies").update({status:"discovered",updated_at:new Date().toISOString()}).eq("id",id);
+   await db.schema("booked_solid").from("companies").update({status:"discovered",recommended_offer:offer,fit_score:fit,updated_at:new Date().toISOString()}).eq("id",id);
   } else {
    await db.schema("booked_solid").from("companies").update({status:"rejected",recommended_offer:null,updated_at:new Date().toISOString()}).eq("id",id);
   }
