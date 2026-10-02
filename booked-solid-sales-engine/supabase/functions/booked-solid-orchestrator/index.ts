@@ -356,13 +356,25 @@ async function planCycle(body: any) {
     .filter((x:any)=>!x.brain_canary||x.brain_decision==="exploit"||["champion","exploit"].includes(String(x.portfolio_lane||"")))
     .filter((x:any)=>String(x.portfolio_lane||"")!=="explore");
   const exploitSorted=[...exploitPool].sort((a:any,b:any)=>portfolioRank(b,exploitPool)-portfolioRank(a,exploitPool));
-  const exploit = exploitN>0
-    ? exploitSorted.slice(0,exploitN).map((x:any)=>({...x,priority_selection_mode:"exploit"}))
+
+  // Anti-stall routing: do not pre-truncate to requestedLimit before we know
+  // whether the strategy can actually be paired with a compatible source.
+  // Oversample candidates, route them, then take the first requestedLimit
+  // routable jobs while preserving the intended exploit/explore mix.
+  const routingCandidateCap=Math.min(
+    selectionPool.length,
+    Math.max(24,requestedLimit*10)
+  );
+
+  const exploitCandidates = exploitN>0
+    ? exploitSorted
+        .slice(0,Math.min(exploitSorted.length,Math.max(12,exploitN*8)))
+        .map((x:any)=>({...x,priority_selection_mode:"exploit"}))
     : [];
 
-  const exploitIds=new Set(exploit.map((x:any)=>x.id));
-  const explorePool=selectionPool.filter((x:any)=>!exploitIds.has(x.id)&&x.brain_decision!=="deprioritize");
-  const exploration = [...explorePool]
+  const exploitCandidateIds=new Set(exploitCandidates.map((x:any)=>x.id));
+  const explorePool=selectionPool.filter((x:any)=>!exploitCandidateIds.has(x.id)&&x.brain_decision!=="deprioritize");
+  const explorationCandidates = [...explorePool]
     .sort((a:any,b:any)=>{
       const rank=(x:any)=>{
         const age=x.last_used_at?Math.min(36,(Date.now()-new Date(x.last_used_at).getTime())/3600000):36;
@@ -376,11 +388,22 @@ async function planCycle(body: any) {
       };
       return rank(b)-rank(a);
     })
-    .slice(0,exploreN)
+    .slice(0,Math.min(explorePool.length,Math.max(12,exploreN*8)))
     .map((x:any)=>({...x,priority_selection_mode:"explore"}));
 
-  const selected=[...exploit,...exploration].slice(0,requestedLimit);
-  const strategies = selected.map((s:any)=>({...s,target_location:marketFor(s,marketRows??[],brainEnabled,brainCanaryPct)}));
+  const primaryIds=new Set([...exploitCandidates,...explorationCandidates].map((x:any)=>x.id));
+  const spilloverCandidates=selectionPool
+    .filter((x:any)=>!primaryIds.has(x.id)&&x.brain_decision!=="deprioritize")
+    .sort((a:any,b:any)=>portfolioRank(b,selectionPool)-portfolioRank(a,selectionPool))
+    .slice(0,Math.max(0,routingCandidateCap-exploitCandidates.length-explorationCandidates.length))
+    .map((x:any)=>({
+      ...x,
+      priority_selection_mode:["champion","exploit"].includes(String(x.portfolio_lane||""))?"exploit":"explore"
+    }));
+
+  const selectedCandidates=[...exploitCandidates,...explorationCandidates,...spilloverCandidates]
+    .slice(0,routingCandidateCap);
+  const strategies = selectedCandidates.map((s:any)=>({...s,target_location:marketFor(s,marketRows??[],brainEnabled,brainCanaryPct)}));
   const { data: allEnabledSources } = await db.schema("booked_solid").from("source_catalog").select("*").eq("enabled",true);
   const coolingSources=(allEnabledSources??[]).filter((x:any)=>sourceCooling(x));
   const degradedSources=(allEnabledSources??[]).filter((x:any)=>!sourceCooling(x)&&(Number(x.consecutive_errors||0)>=4||String(x.metadata?.state||"")==="degraded"));
@@ -404,11 +427,14 @@ async function planCycle(body: any) {
     const rights=String(x?.metadata?.source_v22?.rights_status??x?.metadata?.brain_v2?.rights_status??"");
     const recoveryLane=String(x?.metadata?.source_v22?.portfolio_lane??"");
     const brainLane=String(x?.metadata?.brain_v2?.lane??"");
-    if(rights==="BLOCKED"||rights==="INTERNAL_ONLY"||brainLane==="blocked")return "blocked";
-    if(rights==="REVIEW_REQUIRED")return "exploration_only";
+    if(rights==="BLOCKED"||rights==="INTERNAL_ONLY"||rights==="REVIEW_REQUIRED")return "blocked";
+    // Source Recovery v2.2 is newer than the legacy source brain lane. When
+    // rights are ALLOWED and v2.2 has a production classification, trust that
+    // classification instead of a stale legacy "blocked" lane.
     if(rights==="ALLOWED"&&recoveryLane==="champion")return "proven";
     if(rights==="ALLOWED"&&recoveryLane==="challenger")return "testing";
     if(rights==="ALLOWED"&&recoveryLane==="exploration")return "exploration_only";
+    if(brainLane==="blocked")return "blocked";
     if(brainLane==="proven")return "proven";
     if(brainLane==="testing")return "testing";
     if(brainLane==="exploration")return "exploration_only";
@@ -443,7 +469,19 @@ async function planCycle(body: any) {
       -(zeroGuard?25:0)-rightsPenalty;
   };
   const autoActiveSources=(sources??[])
-    .filter((x:any)=>["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||""))&&["active","canary"].includes(String(x.lifecycle_state||"")))
+    .filter((x:any)=>{
+      if(!["generic_socrata","generic_arcgis"].includes(String(x.metadata?.adapter||"")))return false;
+      const lifecycle=String(x.lifecycle_state||"");
+      if(["active","canary"].includes(lifecycle))return true;
+      const v22=x?.metadata?.source_v22??{};
+      const recoveryChampion=
+        String(v22?.rights_status??"")==="ALLOWED"
+        && String(v22?.portfolio_lane??"")==="champion"
+        && Number(v22?.technical_reliability_score??0)>=80
+        && Number(x?.consecutive_errors??0)===0
+        && !sourceCooling(x);
+      return recoveryChampion;
+    })
     .sort((a:any,b:any)=>sourceRankValue(b)-sourceRankValue(a));
   const osmTrades=new Set(["Roofing","Commercial Roofing","HVAC","Commercial HVAC","Plumbing","Electrical","Painting","Flooring","Landscaping","General Contractor","Commercial Contractor","Construction","Windows","Deck Builder","Deck Patio","Cabinet","Remodeling","Bathroom Remodeling","Kitchen Remodeling","Kitchen Bath Remodeling","Home Builder","Custom Home Builder","Siding","Concrete","Mixed","Property Operations"]);
   const sourceTradeHint=(source:any)=>{
@@ -581,13 +619,47 @@ async function planCycle(body: any) {
     let routedStrategy={...s,target_location:market};
     let source:any=chooseBaseSource(routedStrategy);
 
-    // If the selected market has no compatible source, preserve the strategy
-    // and safely reroute it to the best source-compatible market instead of
-    // falling back to an unrelated local dataset or dropping the whole cycle.
+    const rankedMarkets=[...(marketRows??[])]
+      .filter((m:any)=>["testing","active"].includes(String(m.lifecycle_state||"active")))
+      .sort((a:any,b:any)=>marketRankValue(b)-marketRankValue(a));
+
+    // Recovery acceleration for exploit jobs: evaluate multiple safe
+    // source/market pairs and choose the highest-value ALLOWED pair.
+    // This restores the productive Phoenix/Washington behavior without
+    // weakening identity, rights, trade, or geo guards.
+    if(String(s.priority_selection_mode||"exploit")==="exploit"){
+      let best:any=null;
+      const candidateMarkets=[
+        {display_name:market},
+        ...rankedMarkets.slice(0,18)
+      ];
+      const seen=new Set<string>();
+      for(const m of candidateMarkets){
+        const candidate=String(m.display_name||"");
+        if(!candidate||seen.has(candidate))continue;
+        seen.add(candidate);
+        const attempt={...s,target_location:candidate};
+        const candidateSource=chooseBaseSource(attempt);
+        if(!candidateSource||!discoveryCapable(candidateSource,trade,candidate))continue;
+        const rights=String(candidateSource?.metadata?.source_v22?.rights_status??candidateSource?.metadata?.brain_v2?.rights_status??"");
+        if(rights!=="ALLOWED")continue;
+        const score=
+          sourceRankValue(candidateSource)
+          + marketRankValue((marketRows??[]).find((x:any)=>x.display_name===candidate)??{})*0.08;
+        if(!best||score>best.score){
+          best={score,market:candidate,strategy:attempt,source:candidateSource};
+        }
+      }
+      if(best){
+        market=best.market;
+        routedStrategy=best.strategy;
+        source=best.source;
+      }
+    }
+
+    // If the selected market still has no compatible source, preserve the
+    // strategy and safely reroute it instead of dropping the cycle.
     if(!source){
-      const rankedMarkets=[...(marketRows??[])]
-        .filter((m:any)=>["testing","active"].includes(String(m.lifecycle_state||"active")))
-        .sort((a:any,b:any)=>marketRankValue(b)-marketRankValue(a));
       const rotated=rankedMarkets.length
         ? rankedMarkets.slice(hashText(String(s.slug)+":"+useCount)%rankedMarkets.length)
             .concat(rankedMarkets.slice(0,hashText(String(s.slug)+":"+useCount)%rankedMarkets.length))
@@ -598,6 +670,8 @@ async function planCycle(body: any) {
         const attempt={...s,target_location:candidate};
         const candidateSource=chooseBaseSource(attempt);
         if(candidateSource&&discoveryCapable(candidateSource,trade,candidate)){
+          const rights=String(candidateSource?.metadata?.source_v22?.rights_status??candidateSource?.metadata?.brain_v2?.rights_status??"");
+          if(rights!=="ALLOWED")continue;
           market=candidate;
           routedStrategy=attempt;
           source=candidateSource;
@@ -654,7 +728,23 @@ async function planCycle(body: any) {
     }};
   }).filter(Boolean) as any[];
 
-  if(!routed.length){
+  const routedExploit=routed.filter((x:any)=>String(x.strategy?.priority_selection_mode||"")==="exploit");
+  const routedExplore=routed.filter((x:any)=>String(x.strategy?.priority_selection_mode||"")==="explore");
+  const finalRouted:any[]=[
+    ...routedExploit.slice(0,exploitN),
+    ...routedExplore.slice(0,exploreN)
+  ];
+  const finalIds=new Set(finalRouted.map((x:any)=>String(x.strategy?.id||"")));
+  if(finalRouted.length<requestedLimit){
+    for(const x of routed){
+      const id=String(x.strategy?.id||"");
+      if(finalIds.has(id))continue;
+      finalRouted.push(x); finalIds.add(id);
+      if(finalRouted.length>=requestedLimit)break;
+    }
+  }
+
+  if(!finalRouted.length){
     const enrichment=await queueOneEnrichment();
     const contactIntel=await queueContactIntelligenceV2(2);
     return json({
@@ -673,11 +763,11 @@ async function planCycle(body: any) {
     },200);
   }
 
-  const jobs=routed.map((x:any)=>x.job);
+  const jobs=finalRouted.slice(0,requestedLimit).map((x:any)=>x.job);
   const { data: queued, error } = await db.schema("booked_solid").from("work_queue").insert(jobs).select("id,kind,priority,payload");
   if (error) throw error;
 
-  await Promise.all(routed.map((x:any)=>{
+  await Promise.all(finalRouted.slice(0,requestedLimit).map((x:any)=>{
     const s=x.strategy;
     return db.schema("booked_solid").from("search_strategies").update({
       last_used_at:new Date().toISOString(),
@@ -707,6 +797,9 @@ async function planCycle(body: any) {
       cooling_enabled_sources: coolingSources.length,
       degraded_enabled_sources: degradedSources.length,
       selected_source: queued?.[0]?.payload?.source_slug??null,
+      routing_candidates:strategies.length,
+      routable_candidates:routed.length,
+      queued_after_routing:queued?.length??0,
       cooling_sources: coolingSources.slice(0,8).map((x:any)=>({slug:x.slug,cooldown_until:x.metadata?.cooldown_until??null,last_error_class:x.metadata?.last_error_class??null}))
     },
     strategy_brain:{
