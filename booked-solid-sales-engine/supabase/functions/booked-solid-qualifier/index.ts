@@ -46,7 +46,11 @@ Deno.serve(async req=>{
   const contractorTrades=["HVAC","Roofing","Plumbing","Electrical","Remodeling","Painting","Fence","General Contractor","Commercial Contractor","Cabinet","Flooring","Concrete","Landscaping","Windows","Siding","Deck Builder","Home Builder","Construction"];
   const fit=contractorTrades.includes(company.trade)?25:company.trade==="Property Operations"?22:15;
   const painTypes=["estimation_pain","field_quoting","change_orders","workflow_complexity"];
-  const pain=Math.min(35,Array.from(types).filter(t=>painTypes.includes(t)).length*12);
+  const digitalTypes=["seo_foundation_gap","website_conversion_gap"];
+  const operationalPainCount=Array.from(types).filter(t=>painTypes.includes(t)).length;
+  const digitalPainCount=Array.from(types).filter(t=>digitalTypes.includes(t)).length;
+  const websiteGrowthNeed=types.has("seo_foundation_gap")&&types.has("website_conversion_gap");
+  const pain=Math.min(35,operationalPainCount*12+digitalPainCount*5);
   const realEvidenceTypes=new Set(rows.filter((x:any)=>x.evidence_type!=="search_result").map((x:any)=>String(x.evidence_type||"")));const evidenceScore=Math.min(20,realEvidenceTypes.size*4);
   const usableContact=(contacts??[]).find((c:any)=>c.email&&!weakMailbox(c.email)&&c.status!=="invalid"&&c.status!=="suppressed");const contact=usableContact?.email_confidence??0;
   const contactScore=Math.min(20,Number(contact)/5);
@@ -54,8 +58,9 @@ Deno.serve(async req=>{
   let offer="custom_estimator";
   if(types.has("change_orders"))offer="penmark";
   else if(types.has("workflow_complexity")&&!types.has("estimation_pain"))offer="automation";
-  const prospectType=types.has("estimation_pain")||types.has("field_quoting")||types.has("change_orders")?"pain_led":"fit_led";
-  const why=triggers.strongest?.claim||(prospectType==="pain_led"?"Public evidence shows a relevant operational/estimating signal.":"Company appears to fit Booked Solid's target customer profile; no pain is assumed.");
+  else if(websiteGrowthNeed&&!types.has("estimation_pain")&&!types.has("field_quoting"))offer="website_growth";
+  const prospectType=offer==="website_growth"?"digital_led":types.has("estimation_pain")||types.has("field_quoting")||types.has("change_orders")?"pain_led":"fit_led";
+  const why=triggers.strongest?.claim||(prospectType==="digital_led"?"Public website evidence shows measurable conversion and SEO-foundation gaps in the sampled HTML.":prospectType==="pain_led"?"Public evidence shows a relevant operational/estimating signal.":"Company appears to fit Booked Solid's target customer profile; no pain is assumed.");
   const priorQualified=(existingLeads??[]).some((x:any)=>x.status==="qualified");
   const status=priorQualified?"qualified":score>=65&&realEvidenceTypes.size>=1?"qualified":score>=40?"candidate":"rejected";
   const priorBrief=(existingLeads??[]).find((x:any)=>x.status==="qualified")?.lead_brief??(existingLeads??[])[0]?.lead_brief??{};
