@@ -424,3 +424,11 @@ OSM remains historically strong: recent source yield showed about 125 valid lead
 The production canary did not pass. A single OSM Phoenix HVAC discover job `db4b065d-7887-4919-961e-e6c39f2d3223` first failed with `overpass_http_406`. Worker v124 reduced OSM discovery radius from 40km to 15km, changed Overpass timeout to 8s, capped discovery output at 25 rows, and prefers `overpass-api.de`, but the Edge Runtime still returned `overpass_http_0`. No OSM companies or leads were produced by the canary.
 
 Keep OSM in Technical Recovery until an Edge Runtime probe succeeds. Do not re-enable OSM production discovery merely because an off-platform/local Overpass test succeeds. The next safe step is one successful Edge probe through the existing `solidos-osm-technical-recovery-probe`; only then set OSM back to an internal-only ALLOWED canary and queue one discover job.
+
+## v13 — Source mix recovery after weak lead flow
+
+Lead flow looked stalled while the infrastructure was healthy. The cause was source mix, not worker failure: NYC DOB produced 54 companies in the last 120 minutes with 53 rejected and 0 leads; Austin produced 6 companies with 6 rejected and 0 leads. At the same time Phoenix/Mesa Building Permits was incorrectly paused even though Source Recovery v22 classified it as an ALLOWED champion with technical reliability 100 and median company-to-lead around 2.8 minutes.
+
+Recovery action: reactivate `auto-socrata-building-permits-dzpkhxfb` when Source Recovery says ALLOWED/champion/technical=100/zero errors, and place temporary cooldowns on reject-heavy zero-yield exploration sources such as `nyc_dob_permits` and `austin_construction_permits`. Acceptance: planner selected Phoenix/Mesa, queued 6 jobs, 3 completed quickly, and 11 Phoenix companies were created with no worker failures.
+
+Rule: if lead flow weakens while pg_net, workers, and queues are healthy, inspect source mix before changing scoring. A champion source paused while zero-yield exploration is active is a real routing/source-state bug.
