@@ -166,3 +166,28 @@ The database copy of this document is authoritative for the latest version:
 ## Automatic discovery by future chats
 
 `solidos_control.system_snapshot()` now exposes an `operating_playbook` object containing the required flag, current playbook version, read function, and GitHub path. Any future agent that performs the normal SolidOS health check should therefore discover this playbook automatically before changing lead generation.
+
+## Continuous Lead Flow v2
+
+The current proven recovery baseline is **Orchestrator v59 + Worker v116**.
+
+A recurring “works, adds leads, then appears to stop” pattern was traced to multiple interacting bottlenecks rather than a single scoring problem:
+
+- productive Socrata pages were being revisited after the small rotation window saturated;
+- Nominatim cooldown could defer otherwise usable companies for 15–20 minutes;
+- Resolve capacity reacted too slowly to bursts;
+- pg_net worker calls could accumulate while the worker appeared active;
+- event-driven dispatch and the 1-minute worker cron could amplify the same stalled pg_net queue.
+
+Current doctrine:
+
+1. **Persistent atomic Socrata cursor.** `booked_solid.source_scan_state` + `booked_solid.claim_source_scan_page(...)` assign sequential pages to parallel jobs. Default scan depth is 60 pages. Do not replace this with a small hash-only page rotation.
+2. **Nominatim is enrichment, not a hard gate.** If an ALLOWED source already provides useful city/state, a Nominatim cooldown must not freeze the company. Continue immediately to qualification fallback using source evidence; identity/geography and qualification thresholds remain unchanged.
+3. **Resolve burst capacity.** When Resolve due>=3 or oldest>75s, allocate 2–5 workers; if oldest>180s or arrivals exceed completions, allocate 3–6 workers, within the global cap of 12.
+4. **pg_net watchdog.** `solidos_control.pgnet_watchdog()` runs every minute. A stall is 2+ queued worker calls with no fresh pg_net response for >=75s; recover with the official `net.worker_restart()`, with restart cooldown.
+5. **Queue guards on both dispatch paths.** Cron and event-driven dispatch must not add worker calls into a stalled queue. Event dispatch remains enabled for speed while healthy; cron provides eventual pickup.
+6. **Productive exploration.** Explore strategy ideas mostly on proven/testing sources. Keep true source exploration small; mature zero-yield sources must not consume a large share of Resolve capacity.
+
+Live acceptance after these changes produced new leads automatically, including **LYNDEN SHEET METAL INC** as Qualified (score 70, trigger 35) in about **4.81 minutes**, and **DIMENSIONAL COMMUNICATIONS INC** as a new Candidate in about **2.95 minutes**, without manual worker dispatch.
+
+If flow becomes bursty again, inspect **cursor progress → Nominatim deferrals → Resolve backlog → pg_net response age/queue → event+cron dispatch amplification** before changing scoring thresholds or source safety gates.
