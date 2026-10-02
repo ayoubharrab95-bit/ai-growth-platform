@@ -175,8 +175,9 @@ async function queueOneEnrichment(){
     kind:"research",priority,
     payload:{company_id:next.company_id,strategy_id:next.strategy_id,reason:"website_intelligence_v2_incremental"},
     status:"pending",available_at:new Date().toISOString()
-  }).select("id,priority,payload").single();
+  }).select("id,priority,payload").maybeSingle();
   if(error)throw error;
+  if(!data)return null;
   return {job_id:data.id,company_id:next.company_id,lead_id:next.id,lead_status:next.status,lead_score:score,priority,enrichment_target_version:2};
 }
 
@@ -208,15 +209,16 @@ async function queueContactIntelligenceV2(limit=2){
     if((existing??[]).length){
       const row=existing![0];
       const payload={...(row.payload??{}),lead_id:lead.id,company_id:lead.company_id,reason:"contact_intelligence_v2_backfill",force_contact_intelligence_v2:true};
-      const {data:u}=await db.schema("booked_solid").from("work_queue")
+      const {data:u,error:updateError}=await db.schema("booked_solid").from("work_queue")
         .update({priority,available_at:new Date().toISOString(),payload,updated_at:new Date().toISOString()})
-        .eq("id",row.id).select("id,priority,payload").single();
+        .eq("id",row.id).select("id,priority,payload").maybeSingle();
+      if(updateError)throw updateError;
       if(u)queued.push({job_id:u.id,lead_id:lead.id,company_id:lead.company_id,accelerated_existing:true,priority});
     }else{
       const {data:i,error}=await db.schema("booked_solid").from("work_queue").insert({
         kind:"contact",priority,payload:{lead_id:lead.id,company_id:lead.company_id,contact_retry:0,reason:"contact_intelligence_v2_backfill",force_contact_intelligence_v2:true},
         status:"pending",available_at:new Date().toISOString()
-      }).select("id,priority,payload").single();
+      }).select("id,priority,payload").maybeSingle();
       if(error)throw error;
       if(i)queued.push({job_id:i.id,lead_id:lead.id,company_id:lead.company_id,accelerated_existing:false,priority});
     }
@@ -225,8 +227,10 @@ async function queueContactIntelligenceV2(limit=2){
 }
 
 async function planCycle(body: any) {
-  const { data: settings } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).single();
-  if (!settings?.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
+  const { data: settings, error: settingsError } = await db.schema("booked_solid").from("runtime_settings").select("*").eq("id", true).maybeSingle();
+  if(settingsError)throw settingsError;
+  if(!settings) return json({ ok: true, paused: true, reason: "runtime_settings_missing", email_gate: "blocked_until_email_configuration" });
+  if (!settings.search_enabled) return json({ ok: true, paused: true, reason: "search_disabled", email_gate: "blocked_until_email_configuration" });
   const brainEnabled=Boolean(settings?.strategy_brain_enabled);
   const brainCanaryPct=Math.max(0,Math.min(80,Number(settings?.strategy_brain_canary_pct??15)));
   const balancedGrowthEnabled=Boolean(settings?.balanced_growth_enabled);
